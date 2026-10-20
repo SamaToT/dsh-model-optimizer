@@ -18,7 +18,7 @@
 # skipped. Your selected model (composer / agent default) is always tried FIRST.
 - insert:
     - id: llm-failover
-      name: "dsh-llm-failover"
+      name: "dsh-model-optimizer"
       config:
         escalateOn:
           - QUOTA

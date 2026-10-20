@@ -1,4 +1,4 @@
-// @deepseek-ai/dsh-llm-failover
+// @deepseek-ai/dsh-model-optimizer
 //
 // Cost-tiered model failover for DeepSeek Harness — UNIVERSAL / zero-config.
 //
@@ -163,6 +163,18 @@ const Config = z.object({
   // TRANSPORT/EMPTY_RESPONSE). Leave false: dsh-llm-retry already retries the
   // same route on those.
   escalateOnTransient: z.boolean().default(false),
+  // A route that always ends the chain and is never switched away from.
+  //
+  // When a chain is exhausted the plugin normally just lets the turn fail, so
+  // the last route tried is whatever the tiering put last. Naming a fallback
+  // here pins it: it is appended to the chain, tried last, and a failure on it
+  // ends the turn instead of escalating again — which is what keeps a chain
+  // that cannot serve the request from looping.
+  fallback: z.object({ provider: z.string(), model: z.string() }).required(false),
+  // How long a route that just failed is skipped for, in milliseconds. The
+  // same route failing twice in a row inside the window is not retried; the
+  // chain moves on immediately. 0 disables the cooldown.
+  cooldownMs: z.number().step(1).min(0).default(60000),
 });
 
 function keyOf(turn, step) {
@@ -505,6 +517,10 @@ function apply(ctx, config = {}) {
   let lastAnnounced;
   // The route the failover started from, named in the notice.
   let lastSelection;
+  // Route -> cooldown deadline (ms epoch). A route inside its window is not
+  // tried again until it passes, so a route that just failed cannot be picked
+  // twice in a row.
+  const cooldowns = new Map();
 
   // Chain cache; invalidated when adapters change.
   let chainCache = null;
@@ -622,7 +638,17 @@ function apply(ctx, config = {}) {
       }
 
       // free -> credits -> paid, preserving discovery order inside each tier.
-      const chain = [...tiers.free, ...tiers.credits, ...tiers.paid];
+      let chain = [...tiers.free, ...tiers.credits, ...tiers.paid];
+
+      // A configured fallback is appended and pinned: it is the last route
+      // tried and a failure on it ends the turn instead of escalating again.
+      const fb = cfg.fallback;
+      if (fb !== undefined && typeof fb.provider === "string" && fb.provider !== "") {
+        const key = `${fb.provider}/${fb.model}`;
+        chain = chain.filter((route) => `${route.provider}/${route.model}` !== key);
+        chain.push({ provider: fb.provider, model: fb.model, fallback: true });
+      }
+
       chainCache = chain;
       chainBuilding = null;
       ctx.logger?.debug?.(
@@ -631,12 +657,44 @@ function apply(ctx, config = {}) {
       );
       debug(
         `chain free=${tiers.free.length} credits=${tiers.credits.length} paid=${tiers.paid.length} :: ` +
-          chain.map((r) => `${r.provider}/${r.model}`).join(" > ")
+          chain.map((r) => `${r.provider}/${r.model}${r.fallback ? "(fallback)" : ""}`).join(" > ")
       );
       return chain;
     })();
 
     return chainBuilding;
+  }
+
+  /** Whether a route is inside its cooldown window. */
+  function cooling(route) {
+    const until = cooldowns.get(`${route.provider}/${route.model}`);
+    if (until === undefined) return false;
+    if (until <= Date.now()) {
+      cooldowns.delete(`${route.provider}/${route.model}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * The next chain position after `from` whose route is not in cooldown.
+   *
+   * The selection itself is skipped when it appears in the chain (it was just
+   * tried), and a route that just failed is skipped while it cools down. The
+   * pinned fallback is exempt from the selection skip: when the selection and
+   * the fallback are the same route, it is still the end of the chain and must
+   * be reachable. When nothing is left the walk returns -1.
+   */
+  function nextPos(chain, from, selection) {
+    const last = chain.length - 1;
+    for (let pos = from + 1; pos < chain.length; pos++) {
+      const route = chain[pos];
+      const pinned = pos === last && route.fallback === true;
+      if (!pinned && selection !== undefined && sameRoute(route, selection)) continue;
+      if (!pinned && cooling(route)) continue;
+      return pos;
+    }
+    return -1;
   }
 
   /** Resolve the route to use for the current cursor. */
@@ -861,16 +919,32 @@ function apply(ctx, config = {}) {
           selection: { provider: payload.provider, model: payload.model ?? "" },
         };
 
-      // Advance to the next cost-ordered entry, skipping the selection if it
-      // appears in the chain.
-      let pos = cur.pos;
-      for (let i = 0; i < chain.length + 1; i++) {
-        pos += 1;
-        if (pos >= chain.length) break;
-        if (!sameRoute(chain[pos], cur.selection)) break;
+      // The route that just failed: cool it down so it is not picked again.
+      // Only a route the plugin actually chose counts — the selection is what
+      // the user asked for, and cooling it would also cool the fallback when
+      // the two happen to be the same route.
+      const failed = cur.pos >= 0 ? chain[cur.pos] : undefined;
+      if (failed !== undefined && failed.provider !== undefined && failed.provider !== "") {
+        const window = cfg.cooldownMs;
+        if (typeof window === "number" && window > 0) {
+          cooldowns.set(`${failed.provider}/${failed.model}`, Date.now() + window);
+          debug(`cooldown ${failed.provider}/${failed.model} for ${window}ms`);
+        }
       }
 
-      if (pos >= chain.length) {
+      // The pinned fallback is the end of the road: a failure on it is not
+      // escalated, so a chain that cannot serve the request fails loudly
+      // instead of looping.
+      const last = chain[chain.length - 1];
+      if (last?.fallback === true && failed !== undefined && sameRoute(last, failed)) {
+        debug("fallback route failed; ending the turn");
+        return next();
+      }
+
+      // Advance to the next route that is neither the selection nor cooling
+      // down.
+      const pos = nextPos(chain, cur.pos, cur.selection);
+      if (pos < 0) {
         // Walked the whole chain; nothing left. Hand back to default handling
         // (which ends the turn with the failure).
         return next();
@@ -902,6 +976,7 @@ function apply(ctx, config = {}) {
     disposeAssemble();
     disposePreStep();
     state.clear();
+    cooldowns.clear();
     invalidate();
   }, "llm-failover: dispose listeners");
 }

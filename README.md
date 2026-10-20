@@ -31,7 +31,7 @@ DSH 自带的重试只会重试**同一个模型**（`@deepseek-ai/dsh-llm-retry
 ## 安装
 
 ```sh
-dsh plugin --profile <你的 profile> add dsh-llm-failover
+dsh plugin --profile <你的 profile> add dsh-model-optimizer
 ```
 
 然后重启 DSH。插件自带的 bundle patch 会完成注册，不需要改任何配置。
@@ -129,6 +129,10 @@ config:
     - UNSUPPORTED_REASONING_EFFORT
   # 是否也对瞬态错误换模型。建议 false：那类交给 dsh-llm-retry 重试。
   escalateOnTransient: false
+  # 永久兜底路由：永远排链尾，它失败即止（不再 retry）。留空则用链尾那个。
+  fallback: { provider: "", model: "" }
+  # 刚失败的路由在冷却期内不再被选，毫秒。0 = 关闭。
+  cooldownMs: 60000
 ```
 
 ### 失败码
@@ -139,6 +143,33 @@ config:
 | `RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE` | 不换——交给 `dsh-llm-retry` 重试同一路由 |
 
 整条链跑完仍失败的步骤会以最后一个错误结束这一轮，与现在行为一致。不会死循环。
+
+### 永久兜底（fallback）
+
+不配置 `fallback` 时，链尾是分层排出来的最后一个（通常是最贵的付费档）。你可以**指定**一个兜底路由：
+
+```yaml
+config:
+  fallback: { provider: "deepseek-official", model: "deepseek-flash" }
+```
+
+它的保证：
+
+1. **永远排最后** —— 追加到链尾，即使它本来就在链里也会被移到最后
+2. **失败即止** —— 它失败时不再返回 retry，让这一轮明确报错
+
+这正是「链已经无能为力时，用你最信任的模型试最后一次，不行就如实说失败」，避免无限重试。
+
+### 冷却（cooldownMs）
+
+刚失败过的路由在冷却期内不会被再选，默认 60 秒：
+
+```yaml
+config:
+  cooldownMs: 60000   # 0 = 关闭
+```
+
+这样同一条链连续走多次时，不会反复撞到同一个刚坏的模型。兜底路由不受冷却影响——它永远是最后那张牌。
 
 ## 调试日志
 

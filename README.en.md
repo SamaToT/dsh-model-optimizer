@@ -37,7 +37,7 @@ plugin walk the chain.
 ## Install
 
 ```sh
-dsh plugin --profile <your-profile> add dsh-llm-failover
+dsh plugin --profile <your-profile> add dsh-model-optimizer
 ```
 
 Then restart DSH. The plugin's own bundle patch registers it, so nothing else
@@ -144,6 +144,11 @@ config:
     - UNSUPPORTED_REASONING_EFFORT
   # Also switch on transient errors. Leave false: dsh-llm-retry retries those.
   escalateOnTransient: false
+  # Permanent fallback: always last, and a failure on it ends the turn.
+  # Leave empty to use whatever the chain ends with.
+  fallback: { provider: "", model: "" }
+  # How long a route that just failed is skipped, in milliseconds. 0 disables it.
+  cooldownMs: 60000
 ```
 
 ### Failure codes
@@ -155,6 +160,39 @@ config:
 
 A step that exhausts the whole chain ends the turn with the last failure, exactly
 as it does today. Nothing loops.
+
+### Permanent fallback
+
+Without a `fallback` the chain ends with whatever the tiering ranked last —
+usually the most expensive paid route. You can name the fallback yourself:
+
+```yaml
+config:
+  fallback: { provider: "deepseek-official", model: "deepseek-flash" }
+```
+
+Two guarantees:
+
+1. **It always ends the chain** — appended last even when it already appears in
+   the chain.
+2. **A failure on it ends the turn** — no further `retry` is returned.
+
+That is the "when the chain can no longer serve the request, try the model you
+trust most one last time and then fail honestly" case, and it is what keeps an
+exhausted chain from looping.
+
+### Cooldown
+
+A route that just failed is not picked again while it cools down (60s by
+default):
+
+```yaml
+config:
+  cooldownMs: 60000   # 0 disables it
+```
+
+So a chain walked several times does not keep hitting the same model that just
+broke. The fallback is exempt from cooldown — it stays the last card.
 
 ## Debug log
 
