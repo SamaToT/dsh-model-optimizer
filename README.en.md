@@ -12,6 +12,12 @@ built-in way to continue on a different model.
 This plugin adds it. When the model you selected cannot serve the request, it
 switches to another one, **cheapest first**:
 
+> **It filters on cost, not quality.** The "optimizer" in the name means "of the
+> models that can serve the request, the one that costs least" — not "the
+> strongest model". The free tier consults the provider's own ranking, but the
+> credits and paid tiers are ordered purely by price. Keeping you running comes
+> first; spending less comes second.
+
 ```
 free  →  credits  →  paid
 ```
