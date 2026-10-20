@@ -146,6 +146,20 @@ config:
 | `QUOTA`、`ACCOUNT_QUOTA`、`AUTH`、`NO_ADAPTER`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`CONTEXT_WINDOW_EXCEEDED`、`UNSUPPORTED_REASONING_EFFORT` | 换到下一档 |
 | `RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE` | 不换——交给 `dsh-llm-retry` 重试同一路由 |
 
+
+### 短暂限流先重试，持续失败才换
+
+`RATE_LIMIT` 同时是「可重试」和「应切换」：短时限流重试一下就好，长限流（比如「明天才恢复」）
+重试再多也没用。插件用 `retriesBeforeSwitch`（默认 2）区分：同一条路由连续失败超过这个
+次数就停止等待、直接换下一个。
+
+```yaml
+config:
+  retriesBeforeSwitch: 2   # 0 = 第一次失败就换
+```
+
+`CLIENT_ERROR` / `INVALID_REQUEST` 这类「这个请求或这个模型不被接受」的错误会立即切换，不重试。
+
 整条链跑完仍失败的步骤会以最后一个错误结束这一轮，与现在行为一致。不会死循环。
 
 ### 永久兜底（fallback）

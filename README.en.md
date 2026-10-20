@@ -164,6 +164,22 @@ config:
 | `QUOTA`, `ACCOUNT_QUOTA`, `AUTH`, `NO_ADAPTER`, `INVALID_CREDENTIAL`, `MISSING_CREDENTIAL`, `CONTEXT_WINDOW_EXCEEDED`, `UNSUPPORTED_REASONING_EFFORT` | switch to the next tier |
 | `RATE_LIMIT`, `SERVER`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE` | no switch — `dsh-llm-retry` retries the same route |
 
+
+### A short limit retries, a lasting one switches
+
+`RATE_LIMIT` is both retryable and escalating: a brief limit clears on its own, a
+lasting one ("resets tomorrow") never will. `retriesBeforeSwitch` (default 2)
+tells them apart — after that many consecutive failures on one route the plugin
+stops waiting and moves on.
+
+```yaml
+config:
+  retriesBeforeSwitch: 2   # 0 = switch on the first failure
+```
+
+`CLIENT_ERROR` / `INVALID_REQUEST` mean "this request or this model is not
+accepted" and switch immediately, without retrying.
+
 A step that exhausts the whole chain ends the turn with the last failure, exactly
 as it does today. Nothing loops.
 

@@ -106,6 +106,16 @@ const DEFAULT_ESCALATE_ON = [
   // The selected model rejected the requested reasoning effort. Another model
   // may support it; fitReasoningEffort() also drops or remaps the effort.
   "UNSUPPORTED_REASONING_EFFORT",
+  // A rejected request body, an unsupported parameter, a model the upstream
+  // will not serve: the route itself is the problem, so another route may work.
+  // Adapters surface these as CLIENT_ERROR / INVALID_REQUEST.
+  "CLIENT_ERROR",
+  "INVALID_REQUEST",
+  "INVALID_MODEL_REASONING",
+  // The upstream refuses further calls for a while ("quota exceeded, resets
+  // tomorrow"). Retrying the SAME route cannot help — dsh-llm-retry would burn
+  // its whole budget doing nothing — so this switches instead.
+  "RATE_LIMIT",
 ];
 
 /** A route entry in the failover chain. */
@@ -163,6 +173,15 @@ const Config = z.object({
   // TRANSPORT/EMPTY_RESPONSE). Leave false: dsh-llm-retry already retries the
   // same route on those.
   escalateOnTransient: z.boolean().default(false),
+  // How many times one route may fail with a *retryable* code (RATE_LIMIT by
+  // default) before the plugin switches away from it.
+  //
+  // A short rate limit is worth retrying in place — that is what
+  // dsh-llm-retry is for. A long one is not, and there is no way to tell them
+  // apart from the code alone, so this counts: after `retriesBeforeSwitch`
+  // failures on the same route the plugin stops waiting and moves on. 0 means
+  // "switch on the first failure".
+  retriesBeforeSwitch: z.number().step(1).min(0).default(2),
   // A route that always ends the chain and is never switched away from.
   //
   // When a chain is exhausted the plugin normally just lets the turn fail, so
@@ -521,6 +540,9 @@ function apply(ctx, config = {}) {
   // tried again until it passes, so a route that just failed cannot be picked
   // twice in a row.
   const cooldowns = new Map();
+  // "<turn:step>|<provider>/<model>" -> consecutive retryable failures, so a
+  // route that keeps failing is switched away from instead of retried forever.
+  const retryCounts = new Map();
 
   // Chain cache; invalidated when adapters change.
   let chainCache = null;
@@ -905,8 +927,24 @@ function apply(ctx, config = {}) {
           `code=${code} dead=${isDead} transient=${isTransient}`
       );
       if (!isDead && !(escalateTransient && isTransient)) {
-        // Let dsh-llm-retry retry the SAME route (transient errors).
+        // Let dsh-llm-retry retry the SAME route (a transient error).
         return next();
+      }
+
+      // A code in both lists (RATE_LIMIT is retryable AND escalating) is
+      // retried in place a few times first: a short limit recovers on its own,
+      // a long one does not and must switch. The count is per route, per step.
+      const failKey = `${keyOf(turn, step)}|${payload.provider}/${payload.model ?? ""}`;
+      if (isTransient) {
+        const attempts = (retryCounts.get(failKey) ?? 0) + 1;
+        const limit = cfg.retriesBeforeSwitch;
+        if (typeof limit === "number" && attempts <= limit) {
+          retryCounts.set(failKey, attempts);
+          debug(`retry ${attempts}/${limit} on ${payload.provider} before switching (${code})`);
+          return next(); // dsh-llm-retry retries this same route
+        }
+        retryCounts.delete(failKey);
+        debug(`${payload.provider} failed ${attempts}x with ${code}; switching instead of retrying`);
       }
 
       const key = keyOf(turn, step);
@@ -977,6 +1015,7 @@ function apply(ctx, config = {}) {
     disposePreStep();
     state.clear();
     cooldowns.clear();
+    retryCounts.clear();
     invalidate();
   }, "llm-failover: dispose listeners");
 }
