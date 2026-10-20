@@ -1,0 +1,41 @@
+# dsh-llm-failover — cost-tiered model failover (UNIVERSAL / zero-config).
+#
+# This is the plugin's OWN bundle patch layer. It registers the plugin through
+# an `insert` row, exactly like dsh-our-free-model and dsh-workbuddy-connect do.
+# Keeping the insert here (instead of in the profile's user patch) means DSH's
+# plugin manager rewriting cordis.patch.yml cannot drop it.
+#
+# UNIVERSAL behavior (no `chain` configured): on first use the plugin enumerates
+# every route this installation has (ctx.llm.listProviders + listModels) and
+# classifies each into free -> credits -> paid:
+#     our-free-model            -> free
+#     workbuddy                 -> parse the model name ("x0"/"免费" = free, other
+#                                   "x<number>" multiplier = credits)
+#     deepseek-account          -> credits
+#     deepseek-official         -> paid
+#     any unknown provider      -> paid (conservative; override via providerTiers)
+# OFM routes the local availability probe marks region-blocked/unavailable are
+# skipped. Your selected model (composer / agent default) is always tried FIRST.
+- insert:
+    - id: llm-failover
+      name: "dsh-llm-failover"
+      config:
+        escalateOn:
+          - QUOTA
+          - ACCOUNT_QUOTA
+          - AUTH
+          - NO_ADAPTER
+          - INVALID_CREDENTIAL
+          - MISSING_CREDENTIAL
+          - CONTEXT_WINDOW_EXCEEDED
+          - UNSUPPORTED_REASONING_EFFORT
+        escalateOnTransient: false
+        # chain intentionally omitted -> auto-discovery mode.
+        defaultTierForUnknown: paid
+        skipBlockedFreeModels: true
+        # Free tier: try the free lane's best-ranked model first.
+        preferRanked: true
+        # Credits tier: try the cheapest model first (WorkBuddy price list).
+        preferCheapestCredits: true
+        # Write the plugin's decisions here so a switch can be inspected.
+        debugLog: "~/.dsh/llm-failover.log"
