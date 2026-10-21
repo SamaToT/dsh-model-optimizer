@@ -550,7 +550,7 @@ function apply(ctx, config = {}) {
   // UNKNOWN is here because it is DSH's catch-all: it covers both a route that
   // is genuinely broken and a stray network blip, and only the second kind
   // recovers on its own.
-  const TRANSIENT = new Set(["RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT", "EMPTY_RESPONSE", "UNKNOWN"]);
+  const TRANSIENT = new Set(["RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT", "EMPTY_RESPONSE"]);
 
   const excludeProviders = new Set(cfg.excludeProviders ?? []);
   const excludeModels = new Set(cfg.excludeModels ?? []);

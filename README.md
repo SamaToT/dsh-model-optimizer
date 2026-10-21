@@ -131,6 +131,15 @@ config:
     - MISSING_CREDENTIAL
     - CONTEXT_WINDOW_EXCEEDED
     - UNSUPPORTED_REASONING_EFFORT
+    - CLIENT_ERROR
+    - INVALID_REQUEST
+    - INVALID_MODEL_REASONING
+    - RATE_LIMIT
+    - REGION_BLOCKED
+    - AUTHORIZATION_REQUIRED
+    - IMAGE_OFFLOAD_REQUIRED
+    - PI_AI_ERROR
+    - UNKNOWN
   # 是否也对瞬态错误换模型。建议 false：那类交给 dsh-llm-retry 重试。
   escalateOnTransient: false
   # 永久兜底路由：永远排链尾，它失败即止（不再 retry）。留空则用链尾那个。
@@ -143,9 +152,36 @@ config:
 
 | 失败码 | 行为 |
 |---|---|
-| `QUOTA`、`ACCOUNT_QUOTA`、`AUTH`、`NO_ADAPTER`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`CONTEXT_WINDOW_EXCEEDED`、`UNSUPPORTED_REASONING_EFFORT` | 换到下一档 |
-| `RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE` | 不换——交给 `dsh-llm-retry` 重试同一路由 |
+| `QUOTA`、`ACCOUNT_QUOTA`、`AUTH`、`NO_ADAPTER`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`CONTEXT_WINDOW_EXCEEDED`、`UNSUPPORTED_REASONING_EFFORT`、`CLIENT_ERROR`、`INVALID_REQUEST`、`INVALID_MODEL_REASONING`、`REGION_BLOCKED`、`AUTHORIZATION_REQUIRED`、`IMAGE_OFFLOAD_REQUIRED`、`PI_AI_ERROR` | 换到下一档 |
+| `RATE_LIMIT` | 先原地重试 `retriesBeforeSwitch` 次，仍失败就换 |
+| `UNKNOWN` | 换到下一档 |
+| `SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE` | 不换——交给 `dsh-llm-retry` 重试同一路由 |
 
+### 失败码从哪来
+
+DSH 生态里有四层会产生失败码，插件按**稳定的错误码**路由，绝不解析错误文案：
+
+| 来源 | 产生的码 |
+|---|---|
+| `dsh-llm` 核心 | `QUOTA`、`ACCOUNT_QUOTA`、`CONTEXT_WINDOW_EXCEEDED`、`INVALID_CREDENTIAL`、`NO_ADAPTER`、`UNSUPPORTED_REASONING_EFFORT`、`IMAGE_OFFLOAD_REQUIRED` 等 |
+| `dsh-llm-pi-ai` | 把上游 HTTP 状态分类成 `AUTH` / `RATE_LIMIT` / `INVALID_REQUEST` / `SERVER` / `TIMEOUT` / `TRANSPORT`，未分类的落到 `PI_AI_ERROR` |
+| `dsh-our-free-model` | `REGION_BLOCKED`、`AUTHORIZATION_REQUIRED`、`CLIENT_ERROR` 等 |
+| DSH 自身 | 任何非 `HarnessError` 的异常统一归一成 `UNKNOWN`（界面显示为「意外错误」） |
+
+未知的新码不会让插件失效——它只是不会触发切换。想让它触发，把码名加进 `escalateOn` 即可，不用改代码。
+
+### 推理档位自动适配
+
+界面上的档位是全局的（`off` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max`），
+而每个模型只支持其中一部分。档位不匹配时 `dsh-llm` 会抛 `UNSUPPORTED_REASONING_EFFORT`——
+而且它是在**请求还没开始流之前**抛的，那个阶段不会触发 `agent/request-error`，
+所以失败会直接中断这一轮，而不是换模型。
+
+插件因此在请求前就把档位对齐（只用 `llm.resolveModelInfo` 这个公开接口）：
+
+- 模型支持该档位 → 保持不变
+- 不支持但支持别的 → 换成该模型支持的**最高档**（档位数组按升级顺序排列，最后一个即最高）
+- 完全不接档位参数（如声明了空 effort 集、查询直接抛 `INVALID_MODEL_REASONING` 的模型）→ 删掉该参数
 
 ### 短暂限流先重试，持续失败才换
 
@@ -157,8 +193,6 @@ config:
 config:
   retriesBeforeSwitch: 2   # 0 = 第一次失败就换
 ```
-
-`CLIENT_ERROR` / `INVALID_REQUEST` 这类「这个请求或这个模型不被接受」的错误会立即切换，不重试。
 
 整条链跑完仍失败的步骤会以最后一个错误结束这一轮，与现在行为一致。不会死循环。
 

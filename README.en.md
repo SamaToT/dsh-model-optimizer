@@ -148,6 +148,15 @@ config:
     - MISSING_CREDENTIAL
     - CONTEXT_WINDOW_EXCEEDED
     - UNSUPPORTED_REASONING_EFFORT
+    - CLIENT_ERROR
+    - INVALID_REQUEST
+    - INVALID_MODEL_REASONING
+    - RATE_LIMIT
+    - REGION_BLOCKED
+    - AUTHORIZATION_REQUIRED
+    - IMAGE_OFFLOAD_REQUIRED
+    - PI_AI_ERROR
+    - UNKNOWN
   # Also switch on transient errors. Leave false: dsh-llm-retry retries those.
   escalateOnTransient: false
   # Permanent fallback: always last, and a failure on it ends the turn.
@@ -161,9 +170,44 @@ config:
 
 | Code | Behaviour |
 |---|---|
-| `QUOTA`, `ACCOUNT_QUOTA`, `AUTH`, `NO_ADAPTER`, `INVALID_CREDENTIAL`, `MISSING_CREDENTIAL`, `CONTEXT_WINDOW_EXCEEDED`, `UNSUPPORTED_REASONING_EFFORT` | switch to the next tier |
-| `RATE_LIMIT`, `SERVER`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE` | no switch — `dsh-llm-retry` retries the same route |
+| `QUOTA`, `ACCOUNT_QUOTA`, `AUTH`, `NO_ADAPTER`, `INVALID_CREDENTIAL`, `MISSING_CREDENTIAL`, `CONTEXT_WINDOW_EXCEEDED`, `UNSUPPORTED_REASONING_EFFORT`, `CLIENT_ERROR`, `INVALID_REQUEST`, `INVALID_MODEL_REASONING`, `REGION_BLOCKED`, `AUTHORIZATION_REQUIRED`, `IMAGE_OFFLOAD_REQUIRED`, `PI_AI_ERROR` | switch to the next tier |
+| `RATE_LIMIT` | retry the same route `retriesBeforeSwitch` times first, then switch |
+| `UNKNOWN` | switch to the next tier |
+| `SERVER`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE` | no switch — `dsh-llm-retry` retries the same route |
 
+### Where failure codes come from
+
+Four layers in the DSH ecosystem produce failure codes. The plugin routes on the
+**stable code** and never parses an error message:
+
+| Source | Codes |
+|---|---|
+| `dsh-llm` core | `QUOTA`, `ACCOUNT_QUOTA`, `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `NO_ADAPTER`, `UNSUPPORTED_REASONING_EFFORT`, `IMAGE_OFFLOAD_REQUIRED`, … |
+| `dsh-llm-pi-ai` | classifies an upstream HTTP status into `AUTH` / `RATE_LIMIT` / `INVALID_REQUEST` / `SERVER` / `TIMEOUT` / `TRANSPORT`; anything it cannot classify becomes `PI_AI_ERROR` |
+| `dsh-our-free-model` | `REGION_BLOCKED`, `AUTHORIZATION_REQUIRED`, `CLIENT_ERROR`, … |
+| DSH itself | any throw that is not a `HarnessError` is normalized to `UNKNOWN` (the UI shows it as an unexpected error) |
+
+A code nobody has seen yet does not break the plugin — it simply does not
+trigger a switch. Add its name to `escalateOn` to make it count; no code change
+needed.
+
+### The reasoning effort is fitted automatically
+
+The effort picker offers one global list (`off` < `minimal` < `low` < `medium` <
+`high` < `xhigh` < `max`), but each model supports only part of it. A mismatch
+makes `dsh-llm` throw `UNSUPPORTED_REASONING_EFFORT` — and it throws that while
+**resolving** the request, before the stream starts. That phase never reaches
+`agent/request-error`, so the failure would end the turn instead of switching
+models.
+
+The plugin therefore aligns the effort before the request can fail, using only
+the public `llm.resolveModelInfo`:
+
+- the model accepts the level → keep it
+- it does not, but accepts others → use the **highest** level it accepts (the
+  efforts array keeps the escalation order, so the last entry is the highest)
+- it takes no effort parameter at all (an empty effort set, or a lookup that
+  throws `INVALID_MODEL_REASONING`) → drop the parameter
 
 ### A short limit retries, a lasting one switches
 
@@ -176,9 +220,6 @@ stops waiting and moves on.
 config:
   retriesBeforeSwitch: 2   # 0 = switch on the first failure
 ```
-
-`CLIENT_ERROR` / `INVALID_REQUEST` mean "this request or this model is not
-accepted" and switch immediately, without retrying.
 
 A step that exhausts the whole chain ends the turn with the last failure, exactly
 as it does today. Nothing loops.
