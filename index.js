@@ -1,4 +1,5 @@
 // @deepseek-ai/dsh-model-optimizer
+// BUILD_STAMP: 2026-10-21T11:00:00Z (version with fitReasoningEffort catch fix + system-prompt identity sync)
 //
 // Cost-tiered model failover for DeepSeek Harness — UNIVERSAL / zero-config.
 //
@@ -116,6 +117,25 @@ const DEFAULT_ESCALATE_ON = [
   // tomorrow"). Retrying the SAME route cannot help — dsh-llm-retry would burn
   // its whole budget doing nothing — so this switches instead.
   "RATE_LIMIT",
+  // The free lane's own codes (it maps upstream state onto these):
+  //   REGION_BLOCKED          this model is not served from your region;
+  //                           another route may not carry the restriction.
+  //   AUTHORIZATION_REQUIRED  this lane has not been authorized (sign-in or
+  //                           an unclaimed co-paid slot); another provider may
+  //                           already be authorized.
+  "REGION_BLOCKED",
+  "AUTHORIZATION_REQUIRED",
+  // The model cannot take the images the request carries; a model that
+  // accepts images can serve it instead.
+  "IMAGE_OFFLOAD_REQUIRED",
+  // pi-ai's catch-all for an upstream failure it could not classify. Retrying
+  // the same route rarely helps; another route may simply work.
+  "PI_AI_ERROR",
+  // DSH's own catch-all: an error that is not a HarnessError at all is
+  // normalized to UNKNOWN, which the UI shows as an unexpected error. It
+  // covers a genuine "this route is broken" as well as a stray network blip,
+  // so it is retried in place first and only then switched away from.
+  "UNKNOWN",
 ];
 
 /** A route entry in the failover chain. */
@@ -196,6 +216,14 @@ const Config = z.object({
   cooldownMs: z.number().step(1).min(0).default(60000),
 });
 
+/**
+ * A failover cursor key.
+ *
+ * DSH's `turn` payload already carries the session id (e.g.
+ * "session-022699e8-…|103"), so `${turn}:${step}` is globally unique across
+ * sessions without extra keying. Do NOT reference an `agent` variable here —
+ * none is in scope and it throws ReferenceError on every request.
+ */
 function keyOf(turn, step) {
   return `${turn}:${step}`;
 }
@@ -518,7 +546,11 @@ function apply(ctx, config = {}) {
     Array.isArray(cfg.escalateOn) && cfg.escalateOn.length ? cfg.escalateOn : DEFAULT_ESCALATE_ON
   );
   const escalateTransient = cfg.escalateOnTransient === true;
-  const TRANSIENT = new Set(["RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT", "EMPTY_RESPONSE"]);
+  // Codes that are worth retrying on the same route before giving up on it.
+  // UNKNOWN is here because it is DSH's catch-all: it covers both a route that
+  // is genuinely broken and a stray network blip, and only the second kind
+  // recovers on its own.
+  const TRANSIENT = new Set(["RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT", "EMPTY_RESPONSE", "UNKNOWN"]);
 
   const excludeProviders = new Set(cfg.excludeProviders ?? []);
   const excludeModels = new Set(cfg.excludeModels ?? []);
@@ -732,6 +764,30 @@ function apply(ctx, config = {}) {
    * UNSUPPORTED_REASONING_EFFORT, so a chain that moves to a model without the
    * requested effort would fail again on the very next attempt.
    */
+  /**
+   * Fit the requested reasoning effort to what the target model accepts.
+   *
+   * DSH offers one global effort list (off < minimal < low < medium < high <
+   * xhigh < max) while every model supports its own subset, so a level the
+   * picker offers is regularly unsupported by the model that is about to answer.
+   * dsh-llm rejects that with UNSUPPORTED_REASONING_EFFORT — and it rejects it
+   * while resolving the request, BEFORE the stream starts, which is a phase
+   * that never reaches the `agent/request-error` waterfall. The failure would
+   * therefore end the turn instead of switching models.
+   *
+   * So the effort is fitted here, in the request waterfall, before it can fail:
+   *
+   *   - the model accepts the level  -> keep it;
+   *   - it does not, but accepts others -> use the HIGHEST level it accepts
+   *     (the picker may offer a level the model cannot do, and asking for less
+   *     than the model can do wastes capability);
+   *   - it accepts none            -> drop the parameter, which is what such a
+   *     model expects.
+   *
+   * Only public API is used: `llm.resolveModelInfo` reports the model's own
+   * effort set, and its `efforts` array keeps the escalation order, so the last
+   * entry is the highest level that model offers.
+   */
   async function fitReasoningEffort(config, route, signal) {
     const requested = config.reasoningEffort;
     if (requested === undefined) return config;
@@ -742,8 +798,16 @@ function apply(ctx, config = {}) {
       try {
         info = await llm.resolveModelInfo(route.provider, route.model, signal);
       } catch (error) {
-        debug(`effort lookup failed for ${route.provider}/${route.model}: ${error?.message ?? error}`);
-        return config; // cannot tell -> keep as-is and let dsh-llm decide
+        // dsh-llm rejects a model that declares an EMPTY effort set
+        // (INVALID_MODEL_REASONING). That is not a lookup failure: such a model
+        // takes no effort parameter at all, so the request must carry none.
+        debug(
+          `effort lookup failed for ${route.provider}/${route.model} ` +
+            `(${error?.code ?? ""}): ${error?.message ?? error} -> dropping effort`
+        );
+        effortCache.set(cacheKey, null);
+        const { reasoningEffort, ...rest } = config;
+        return rest;
       }
       reasoning = info?.reasoning;
       effortCache.set(cacheKey, reasoning ?? null);
@@ -764,9 +828,19 @@ function apply(ctx, config = {}) {
       return rest;
     }
     const efforts = reasoning.efforts ?? [];
+    if (efforts.length === 0) {
+      // The model declares an empty effort set: it takes no effort parameter.
+      const { reasoningEffort, ...rest } = config;
+      ctx.logger?.debug?.(
+        `llm-failover: dropped reasoning effort "${reasoningEffort}" for ${route.provider}/${route.model} (empty effort set)`
+      );
+      return rest;
+    }
     if (efforts.some((effort) => effort.id === requested)) return config;
-    const fallback = reasoning.defaultEffort ?? efforts[0]?.id;
-    if (fallback === undefined) {
+    // The highest level this model accepts: the efforts array keeps DSH's
+    // escalation order, so the last entry is the strongest one.
+    const highest = efforts[efforts.length - 1];
+    if (highest === undefined) {
       const { reasoningEffort, ...rest } = config;
       ctx.logger?.debug?.(
         `llm-failover: dropped reasoning effort "${requested}" for ${route.provider}/${route.model} (no effort available)`
@@ -774,9 +848,9 @@ function apply(ctx, config = {}) {
       return rest;
     }
     ctx.logger?.debug?.(
-      `llm-failover: reasoning effort "${requested}" -> "${fallback}" for ${route.provider}/${route.model}`
+      `llm-failover: reasoning effort "${requested}" -> "${highest.id}" for ${route.provider}/${route.model}`
     );
-    return { ...config, reasoningEffort: fallback };
+    return { ...config, reasoningEffort: highest.id };
   }
 
   /**
@@ -881,13 +955,6 @@ function apply(ctx, config = {}) {
       if (cur === undefined) {
         cur = { pos: -1, selection: { provider: resolved.provider, model: resolved.model } };
         state.set(key, cur);
-        debug(
-          `request step=${key} selection=${cur.selection.provider}/${cur.selection.model} ` +
-            `effort=${resolved.reasoningEffort ?? "(none)"}`
-        );
-        // The selection itself can reject the requested effort (the composer
-        // offers a global effort list, not per-model). Fit it here too, so the
-        // first attempt works instead of failing and burning a chain slot.
         const fitted = await fitReasoningEffort(resolved, cur.selection, payload.signal);
         debug(
           `request step=${key} -> fitted effort=${fitted.reasoningEffort ?? "(none)"} ` +
