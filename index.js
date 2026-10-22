@@ -231,13 +231,23 @@ const Config = z.object({
 /**
  * A failover cursor key.
  *
- * DSH's `turn` payload already carries the session id (e.g.
- * "session-022699e8-…|103"), so `${turn}:${step}` is globally unique across
- * sessions without extra keying. Do NOT reference an `agent` variable here —
- * none is in scope and it throws ReferenceError on every request.
+ * The key must separate sessions: DSH's `turn` is a plain counter that
+ * restarts per session, so `${turn}:${step}` alone collides between two
+ * sessions that are both on their first turn (and one session's failover
+ * cursor would overwrite the other's).
+ *
+ * The agent instance identifies the session: dsh-agent-loop's `create(id, …)`
+ * prepares the session under that id, so `agent.id` IS the session id. The
+ * agent is fused into every agent/* payload (dsh-agent's agentEvents does
+ * `{ ...payload, agent }`), so it is available at every call site.
+ *
+ * Do NOT reference an `agent` variable that is not in scope — it throws a
+ * ReferenceError on every request.
  */
-function keyOf(turn, step) {
-  return `${turn}:${step}`;
+function keyOf(turn, step, agent) {
+  const id = agent?.id;
+  const session = typeof id === "string" && id !== "" ? id : "";
+  return session === "" ? `${turn}:${step}` : `${session}|${turn}:${step}`;
 }
 
 function sameRoute(a, b) {
@@ -1054,11 +1064,11 @@ function apply(ctx, config = {}) {
     async (payload, next) => {
       const resolved = await next();
       if (!resolved || !resolved.provider || !resolved.model) return resolved;
-      const key = keyOf(payload.turn, payload.step);
-      let cur = state.get(key);
       // The agent this request belongs to. DSH fuses it into the payload, and
       // the prompt for the same agent reads the route back through it.
       const agent = payload.agent;
+      const key = keyOf(payload.turn, payload.step, agent);
+      let cur = state.get(key);
 
       if (cur === undefined) {
         cur = { pos: -1, selection: { provider: resolved.provider, model: resolved.model } };
@@ -1123,7 +1133,21 @@ function apply(ctx, config = {}) {
       // A code in both lists (RATE_LIMIT is retryable AND escalating) is
       // retried in place a few times first: a short limit recovers on its own,
       // a long one does not and must switch. The count is per route, per step.
-      const failKey = `${keyOf(turn, step)}|${payload.provider}/${payload.model ?? ""}`;
+      //
+      // The route is taken from the cursor, not from the error payload: DSH's
+      // agent/request-error payload carries the provider but no model, so a
+      // payload-built key would collapse every model of one provider into a
+      // single counter.
+      const cursorKey = keyOf(turn, step, payload.agent);
+      const cursor = state.get(cursorKey);
+      const failedProvider = payload.provider ?? "";
+      const failedModel =
+        cursor !== undefined
+          ? cursor.pos >= 0
+            ? (await buildChain())[cursor.pos]?.model ?? ""
+            : cursor.selection.model
+          : payload.agent?.options?.model ?? "";
+      const failKey = `${cursorKey}|${failedProvider}/${failedModel}`;
       if (isTransient) {
         const attempts = (retryCounts.get(failKey) ?? 0) + 1;
         const limit = cfg.retriesBeforeSwitch;
@@ -1136,15 +1160,27 @@ function apply(ctx, config = {}) {
         debug(`${payload.provider} failed ${attempts}x with ${code}; switching instead of retrying`);
       }
 
-      const key = keyOf(turn, step);
+      const key = cursorKey;
       const chain = await buildChain();
       if (chain.length === 0) return next(); // no fallbacks available
 
-      let cur =
-        state.get(key) ?? {
+      let cur = state.get(key);
+      if (cur === undefined) {
+        // DSH's agent/request-error payload carries the provider but NOT the
+        // model (dsh-agent-loop dispatches { turn, step, provider, failure,
+        // retryPolicy, signal, agent }), so the failing route has to come from
+        // the agent's own selection — that is the only place that knows both
+        // the provider and the model of the route that was tried.
+        const options = payload.agent?.options;
+        cur = {
           pos: -1,
-          selection: { provider: payload.provider, model: payload.model ?? "" },
+          selection: {
+            provider: payload.provider ?? options?.provider ?? "",
+            model: options?.model ?? "",
+          },
         };
+        state.set(key, cur);
+      }
 
       // The route that just failed: cool it down so it is not picked again.
       //
@@ -1157,8 +1193,12 @@ function apply(ctx, config = {}) {
       // failed (a rate limit, say) was retried on the very next step and hit
       // the same limit again, so one exhausted route kept absorbing requests
       // while the rest of the chain stayed idle.
-      const failed =
-        cur.pos >= 0 ? chain[cur.pos] : { provider: payload.provider, model: payload.model ?? "" };
+      //
+      // The model is taken from the cursor, never from the error payload: the
+      // payload has no model field, and a half-empty route ("workbuddy/")
+      // matches nothing on the chain, so the cooldown would land on a route
+      // that does not exist and the failed one would stay eligible.
+      const failed = cur.pos >= 0 ? chain[cur.pos] : cur.selection;
       if (failed !== undefined && failed.provider !== undefined && failed.provider !== "") {
         const window = cfg.cooldownMs;
         if (typeof window === "number" && window > 0) {
@@ -1205,7 +1245,7 @@ function apply(ctx, config = {}) {
         agentRoutes.set(agent, { provider: fb.provider, model: fb.model });
       }
       ctx.logger?.warn?.(
-        `llm-failover: ${payload.provider}/${payload.model ?? ""} failed (${code}); escalating to ${fb.provider}/${fb.model}`
+        `llm-failover: ${failed.provider ?? ""}/${failed.model ?? ""} failed (${code}); escalating to ${fb.provider}/${fb.model}`
       );
       debug(`escalate pos=${pos} -> ${fb.provider}/${fb.model}`);
       return { kind: "retry" };

@@ -38,11 +38,25 @@ for (const copy of copies) {
   console.log(`=== ${copy.name} (${copy.file}) ===`);
 
   console.log("--- 1. 手选模型失败后写入冷却 ---");
-  const failedDecl = src.match(
-    /const failed\s*=\s*\n?\s*cur\.pos >= 0 \? chain\[cur\.pos\] : \{ provider: payload\.provider, model: payload\.model \?\? "" \};/,
+  // DSH's agent/request-error payload has no model field, so the failing
+  // route must come from the cursor (which remembers the selection), never
+  // from the payload.
+  check(
+    "failed 路由取自 cursor 的 selection（不依赖 payload.model）",
+    /const failed = cur\.pos >= 0 \? chain\[cur\.pos\] : cur\.selection;/.test(src),
   );
-  check("failed 路由对 selection 也构造（不再 undefined）", failedDecl !== null);
+  check(
+    "不再从 error payload 取 model",
+    !/cur\.selection\s*:\s*\{\s*provider: payload\.provider, model: payload\.model/.test(src),
+  );
   check("冷却写入发生在 failed 定义之后", src.indexOf("cooldowns.set(") > src.indexOf("const failed ="));
+
+  console.log("");
+  console.log("--- 1b. cursor key 必须区分会话 ---");
+  check("keyOf 接受 agent 参数", /function keyOf\(turn, step, agent\)/.test(src));
+  check("keyOf 用 agent.id 做会话前缀", /agent\?\.id/.test(src) && /\$\{session\}\|\$\{turn\}:\$\{step\}/.test(src));
+  check("request 阶段传 agent 进 keyOf", /keyOf\(payload\.turn, payload\.step, agent\)/.test(src));
+  check("error 阶段传 agent 进 keyOf", /keyOf\(turn, step, payload\.agent\)/.test(src));
 
   console.log("");
   console.log("--- 2. escalate 不再永远回落 pos=0 ---");

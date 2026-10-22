@@ -67,26 +67,39 @@ console.log("=== A. 手选模型失败 -> escalate 不应落在 pos=0 ===");
 // The user selected our-free-model/kilo-auto/free, which IS chain[0].
 // Simulate: that route fails. The escalation must not land on it again.
 const key = "session-cordis-check|1";
-const turn = "session-cordis-check|1";
+const turn = 1;
 const step = 1;
+// The agent instance identifies the session, exactly as DSH does (the agent's
+// id IS the session id, and the agent is fused into every agent/* payload).
+const agentMain = { id: "session-cordis-check", options: { provider: "our-free-model", model: "kilo-auto/free" } };
 
-const failRoute = async (provider, model, code = "RATE_LIMIT", agent = undefined) => {
+// DSH's agent/request-error payload carries { turn, step, provider, failure,
+// retryPolicy, signal, agent } — it has NO model field. Emitting it with a
+// model would let the plugin "remember" a route that DSH never told it, and
+// the bug this test exists for (a half-empty route like "workbuddy/") would
+// stay hidden.
+const failRoute = async (provider, code = "RATE_LIMIT", agent = agentMain) => {
   // ctx.emit does not return the waterfall result, so the decision is captured
   // from the payload the plugin logs.
   await ctx.emit("agent/request-error", {
     turn, step, signal: undefined,
-    provider, model,
+    provider,
     failure: { code },
     ...(agent === undefined ? {} : { agent }),
   });
 };
 
-await failRoute("our-free-model", "kilo-auto/free");
+// The selection is registered by the request stage first, the way DSH does it.
+await ctx.emit("agent/request", { turn, step, signal: undefined, agent: agentMain }, async () => ({
+  provider: "our-free-model", model: "kilo-auto/free",
+}));
+
+await failRoute("our-free-model");
 
 // Read back which route the plugin picked: fire agent/request and capture the
 // resolved config from inside the waterfall.
 let requested;
-await ctx.emit("agent/request", { turn, step, signal: undefined }, async () => {
+await ctx.emit("agent/request", { turn, step, signal: undefined, agent: agentMain }, async () => {
   requested = { provider: "our-free-model", model: "kilo-auto/free" };
   return requested;
 });
@@ -107,7 +120,7 @@ check("日志里有 cooldown 记录（失败路由进入冷却）", /cooldown ou
 console.log("");
 console.log("=== B. 链上多个模型轮换，不会永远压一个 ===");
 // Fail the escalated route too: the next escalation must move further down.
-await failRoute("our-free-model", "minimax/minimax-m3.1-flash:free");
+await failRoute("our-free-model");
 const logAfter = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
 const allEscalations = (logAfter.match(/escalate pos=(\d+) -> (\S+)/g) || []);
 const positions = allEscalations.map((l) => Number(/escalate pos=(\d+)/.exec(l)[1]));
@@ -126,10 +139,10 @@ console.log("=== C. 中和判定按 session 精确定位 ===");
 const agentA = { id: "session-A", options: { provider: "workbuddy", model: "hy3" } };
 const agentB = { id: "session-B", options: { provider: "freestuff", model: "m1" } };
 
-await ctx.emit("agent/request", { turn: "session-A|1", step: 1, signal: undefined, agent: agentA }, async () => ({
+await ctx.emit("agent/request", { turn: 1, step: 1, signal: undefined, agent: agentA }, async () => ({
   provider: "workbuddy", model: "hy3",
 }));
-await ctx.emit("agent/request", { turn: "session-B|1", step: 1, signal: undefined, agent: agentB }, async () => ({
+await ctx.emit("agent/request", { turn: 1, step: 1, signal: undefined, agent: agentB }, async () => ({
   provider: "freestuff", model: "m1",
 }));
 
@@ -152,7 +165,7 @@ console.log("=== D. escalate 后，下一次 assemble 立刻反映新路由 ==="
 // The invariant is that the provider the rewrite is decided on is the provider
 // the escalation landed on, whatever that provider happens to be.
 const agentC = { id: "session-C", options: { provider: "workbuddy", model: "hy3" } };
-await ctx.emit("agent/request", { turn: "session-C|1", step: 1, signal: undefined, agent: agentC }, async () => ({
+await ctx.emit("agent/request", { turn: 1, step: 1, signal: undefined, agent: agentC }, async () => ({
   provider: "workbuddy", model: "hy3",
 }));
 // Escalate away from workbuddy.
