@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-optimizer",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "模型自动优选 — automatic cost-tiered model failover for DeepSeek Harness: when a model fails, switch to the cheapest available one (free -> credits -> paid), with a pinned permanent fallback and per-route cooldown.",
   "type": "module",
   "main": "./index.js",

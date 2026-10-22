@@ -146,6 +146,9 @@ config:
   fallback: { provider: "", model: "" }
   # 刚失败的路由在冷却期内不再被选，毫秒。0 = 关闭。
   cooldownMs: 60000
+  # 对列出的 provider，把系统提示里的官方身份签名改写掉（见下文「改写官方身份签名」）。
+  # 留空 = 不改任何 provider。
+  neutralizeIdentityFor: []
 ```
 
 ### 失败码
@@ -233,6 +236,54 @@ DSH 的 logger 写到宿主进程 stdout，被桌面 App 吞掉，所以你看�
 config:
   debugLog: "~/.dsh/llm-failover.log"
 ```
+
+## 改写官方身份签名（neutralizeIdentityFor）
+
+部分上游会在系统提示的**开头**做渠道校验：它期望请求来自自家客户端，一旦检测到
+其它 harness 的身份签名（`You are an AI agent powered by DeepSeek Harness.`）就整条拒绝
+（典型表现：`INVALID_REQUEST` / 上游 `11128`「请求被拦截」）。这类 provider 在 DSH 里会
+**完全连不上**，而 DSH 官方的 `includeHarnessIdentity: false` 是**全局**开关——会连你其它
+正常模型一起去掉身份，太重了。
+
+本插件提供更细的刀：只对指定的 provider，在 `system-prompt/assemble` 阶段把
+`harness:identity` 这一段的文字替换成一句中性话：
+
+```
+You are a helpful assistant.
+```
+
+其它 provider、其它段落、对话正文**一字不动**。
+
+```yaml
+config:
+  neutralizeIdentityFor:
+    - workbuddy
+```
+
+### 它改的是哪一层
+
+```
+agent-loop: systemPrompt.assemble()   ← 本插件在这里改写 identity 段文字
+        ↓
+renderPrompt(assembly)                ← 读改写后的文字
+        ↓
+provider 适配器 prepareChatBody()     ← 看到已是 system，原样保留
+        ↓
+发给上游的 system 开头 = "You are a helpful assistant."  → 通过渠道校验
+```
+
+### 何时需要它
+
+仅当某个 provider **稳定地**因身份签名被整条拒绝时才用。如果上游是零星限流或超时，
+那属于瞬态错误，交给 `dsh-llm-retry` 即可，不需要本开关。
+
+### 注意事项
+
+- 只改 `harness:identity` 这一段的文字，段落数量、顺序、其它段落内容均不变。
+- 若某次请求正处于 failover（已经切到别的路由），则按**当前生效的路由**判断要不要改写——
+  切到非列表内 provider 时不会改写，避免误伤。
+- 这是绕开上游渠道校验的权宜之计，依赖上游对"开局一句中性话"的接受度；上游若进一步收紧，
+  需要同步调整这里的替换文案。
 
 ## 说明
 

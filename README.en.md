@@ -164,6 +164,9 @@ config:
   fallback: { provider: "", model: "" }
   # How long a route that just failed is skipped, in milliseconds. 0 disables it.
   cooldownMs: 60000
+  # For the listed providers, rewrite the harness identity signature in the system
+  # prompt (see "Neutralize the harness identity" below). Empty = rewrite none.
+  neutralizeIdentityFor: []
 ```
 
 ### Failure codes
@@ -268,6 +271,62 @@ each route, the failure code of every failed attempt, and every escalation.
 config:
   debugLog: "~/.dsh/llm-failover.log"
 ```
+
+## Neutralize the harness identity (neutralizeIdentityFor)
+
+Some upstreams gate on the **opening** of the system prompt: they expect a request
+from their own client, and reject any other harness's identity signature
+(`You are an AI agent powered by DeepSeek Harness.`) outright — typically surfacing
+as `INVALID_REQUEST` / the upstream `11128` "request blocked". Such a provider is
+**unusable** in DSH, and DSH's own `includeHarnessIdentity: false` is a **global**
+switch — it would strip the identity from your other healthy models too, which is
+overkill.
+
+This plugin offers a finer blade: for the named providers only, at the
+`system-prompt/assemble` stage it replaces the text of the `harness:identity`
+section with a neutral sentence:
+
+```
+You are a helpful assistant.
+```
+
+Every other provider, every other section, and the conversation body are left
+**byte-for-byte intact**.
+
+```yaml
+config:
+  neutralizeIdentityFor:
+    - workbuddy
+```
+
+### What layer it touches
+
+```
+agent-loop: systemPrompt.assemble()   ← this plugin rewrites the identity section here
+        ↓
+renderPrompt(assembly)                ← reads the rewritten text
+        ↓
+provider adapter prepareChatBody()    ← sees it is already a system message, keeps it
+        ↓
+the system opening sent upstream = "You are a helpful assistant."  → passes the gate
+```
+
+### When you need it
+
+Only when a provider **stably** rejects you because of the identity signature. If the
+upstream is merely rate-limiting or timing out, that is transient and belongs to
+`dsh-llm-retry`; you do not need this switch.
+
+### Caveats
+
+- Only the text of the `harness:identity` section changes; the section count, order,
+  and all other section contents are unchanged.
+- If a request is mid-failover (already switched to another route), the rewrite is
+  decided by the **currently active** route — switching to a provider outside the
+  list will not trigger a rewrite, so healthy providers are never touched.
+- This is a stopgap around an upstream channel gate, and depends on the upstream
+  accepting a neutral opening line; if the upstream tightens further, adjust the
+  replacement text here in step.
 
 ## Notes
 

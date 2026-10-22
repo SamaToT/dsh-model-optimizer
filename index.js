@@ -214,6 +214,18 @@ const Config = z.object({
   // same route failing twice in a row inside the window is not retried; the
   // chain moves on immediately. 0 disables the cooldown.
   cooldownMs: z.number().step(1).min(0).default(60000),
+  // Providers whose gateway refuses a system prompt that opens with a rival
+  // client's identity line.
+  //
+  // Some upstreams (WorkBuddy since 2026-10-20) run a channel check on the
+  // opening of the system message and answer such a request with HTTP 400 /
+  // code 11128. DSH's own identity line is exactly such a signature, so the
+  // request is rejected before the model is ever reached.
+  //
+  // For the listed providers the identity section is renamed to a neutral
+  // one. The rest of the prompt is untouched, and every other provider keeps
+  // the identity it has today. Empty disables the behaviour.
+  neutralizeIdentityFor: z.array(z.string()).default([]),
 });
 
 /**
@@ -231,6 +243,14 @@ function keyOf(turn, step) {
 function sameRoute(a, b) {
   return !!a && !!b && a.provider === b.provider && a.model === b.model;
 }
+
+/**
+ * The neutral opening that replaces the harness identity line.
+ *
+ * An upstream that checks the channel by the opening of the system message
+ * only cares that the first line is not a rival client's identity claim.
+ */
+const NEUTRAL_IDENTITY = "You are a helpful assistant.";
 
 /**
  * The availability probe: routes marked region-blocked or unavailable are
@@ -554,6 +574,7 @@ function apply(ctx, config = {}) {
 
   const excludeProviders = new Set(cfg.excludeProviders ?? []);
   const excludeModels = new Set(cfg.excludeModels ?? []);
+  const neutralizeFor = new Set(cfg.neutralizeIdentityFor ?? []);
 
   const llm = ctx.get("llm");
 
@@ -865,24 +886,78 @@ function apply(ctx, config = {}) {
    */
   const disposeAssemble = ctx.on(
     "system-prompt/assemble",
-    async (assembly, _context, next) => {
+    async (assembly, context, next) => {
       const assembled = await next();
       if (!assembled || typeof assembled !== "object") return assembled;
-      const variables = assembled.variables;
-      if (variables === undefined || typeof variables !== "object") return assembled;
       // The route that is actually in use for the step being assembled.
       const active = activeRoute();
-      if (active === undefined) return assembled;
-      return {
-        ...assembled,
-        variables: {
-          ...variables,
-          provider: active.provider,
-          model: active.model
-        }
-      };
+      const variables = assembled.variables;
+
+      let result = assembled;
+      if (variables !== undefined && typeof variables === "object" && active !== undefined) {
+        result = {
+          ...result,
+          variables: {
+            ...variables,
+            provider: active.provider,
+            model: active.model
+          }
+        };
+      }
+
+      return neutralizeIdentity(result, context);
     }
   );
+
+  /**
+   * Replace the harness identity line for providers that refuse it.
+   *
+   * Some upstreams run a channel check on the OPENING of the system message
+   * and answer a prompt that starts with a rival client's identity line with
+   * HTTP 400 / code 11128 ("Illegal API invocation from an unapproved
+   * channel"). The check looks at the opening, not at the content, so a
+   * neutral first line is enough to pass it — the prompt that follows is
+   * delivered unchanged.
+   *
+   * DSH offers no switch for this: `includeHarnessIdentity: false` removes the
+   * line for every provider, and `personaPrefix` is ordered AFTER the identity
+   * section, so it cannot precede it. The rename below is scoped to the
+   * providers that need it and to the request at hand.
+   */
+  function neutralizeIdentity(assembly, context) {
+    if (neutralizeFor.size === 0) return assembly;
+    const provider = routeProviderFor(context);
+    if (provider === undefined || !neutralizeFor.has(provider)) return assembly;
+    const sections = assembly.sections;
+    if (!Array.isArray(sections)) return assembly;
+    let changed = false;
+    const rewritten = sections.map((section) => {
+      if (section?.name !== "harness:identity") return section;
+      if (typeof section.text !== "string") return section;
+      if (section.text.trim() === "") return section;
+      changed = true;
+      return { ...section, text: NEUTRAL_IDENTITY };
+    });
+    if (!changed) return assembly;
+    debug(`neutralized the harness identity for provider ${provider}`);
+    return { ...assembly, sections: rewritten };
+  }
+
+  /**
+   * The provider the prompt is being assembled for.
+   *
+   * The assembly context carries the agent, whose options name the selected
+   * route. A failover in progress replaces it, so that route wins here.
+   */
+  function routeProviderFor(context) {
+    const active = activeRoute();
+    if (active !== undefined) return active.provider;
+    const options = context?.agent?.options;
+    if (options !== undefined && options !== null && typeof options.provider === "string") {
+      return options.provider;
+    }
+    return undefined;
+  }
 
   /** The route currently in use, when a failover has replaced the selection. */
   function activeRoute() {
