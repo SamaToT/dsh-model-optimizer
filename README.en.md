@@ -260,6 +260,36 @@ config:
 So a chain walked several times does not keep hitting the same model that just
 broke. The fallback is exempt from cooldown — it stays the last card.
 
+**The route you selected yourself is cooled down too**: when your own pick is
+rate-limited, it enters the cooldown and the next request does not hit it
+again. A free-tier rate limit does not recover within seconds, so hammering the
+same model exhausts it while the rest of the chain stays idle.
+
+## A failover does not always land on the same model
+
+After a failure the escalation walks **down** the cost chain instead of going
+back to its head.
+
+The chain is ordered by cost (free → credits → paid), so its head is always
+the cheapest route. If every failure went back to the head, then whatever you
+picked — and whatever broke it (a rate limit, a dead credential, a rejected
+signature) — would end up on that one free model: it would carry every request
+until its quota ran out, while dozens of other free models in the chain were
+never used at all.
+
+What actually happens: failure → that route enters the cooldown → the
+escalation moves to the **next** usable route → failure again → cooldown again,
+and further down. Every switch moves forward, so the load spreads over the
+whole chain.
+
+## The identity rewrite is per session
+
+`neutralizeIdentityFor` rewrites the identity line of the provider the
+**current session** is using. The decision is keyed by session id, not by
+"whichever route was switched to last": with several sessions running at once,
+the latter applies one session's decision to another session's request, and the
+provider that needed the rewrite does not get it.
+
 ## Debug log
 
 DSH's logger goes to the host process stdout, which the desktop app swallows, so

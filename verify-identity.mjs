@@ -101,11 +101,15 @@ console.log("\n=== prompt 正文一字不改 ===");
 console.log("\n=== failover 激活时用 failover 的路由判定 ===");
 {
   const { wf } = mk({ neutralizeIdentityFor: ["workbuddy"] });
+  // DSH's agent-loop fuses the agent instance into every agent/* payload, and
+  // the prompt context carries the same instance, so the agent is what links
+  // the two stages.
+  const agent = { id: "session-test-0001", options: { provider: "workbuddy", model: "hy3" } };
   // 先让 workbuddy 失败切换到 our-free-model
-  await wf("agent/request", { turn: 1, step: 1, signal: {} }, () => ({ provider: "workbuddy", model: "hy3" }));
-  await wf("agent/request-error", { turn: 1, step: 1, provider: "workbuddy", model: "hy3", failure: { code: "INVALID_REQUEST" }, signal: {} }, () => undefined);
+  await wf("agent/request", { turn: 1, step: 1, signal: {}, agent }, () => ({ provider: "workbuddy", model: "hy3" }));
+  await wf("agent/request-error", { turn: 1, step: 1, provider: "workbuddy", model: "hy3", failure: { code: "INVALID_REQUEST" }, signal: {}, agent }, () => undefined);
   // 现在 active route 是 our-free-model，即使 agent.options 还是 workbuddy
-  const out = await wf("system-prompt/assemble", ASSEMBLY, { agent: { options: { provider: "workbuddy", model: "hy3" } } }, () => Promise.resolve(ASSEMBLY));
+  const out = await wf("system-prompt/assemble", ASSEMBLY, { agent }, () => Promise.resolve(ASSEMBLY));
   const t = out.sections.find((s) => s.name === "harness:identity")?.text;
   check("已切到 our-free-model -> identity 不该被中和", t === "You are an AI agent powered by DeepSeek Harness.", String(t));
 }

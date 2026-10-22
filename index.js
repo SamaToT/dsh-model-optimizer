@@ -596,6 +596,20 @@ function apply(ctx, config = {}) {
   // "<turn:step>|<provider>/<model>" -> consecutive retryable failures, so a
   // route that keeps failing is switched away from instead of retried forever.
   const retryCounts = new Map();
+  // agent instance -> the route that agent is currently using.
+  //
+  // DSH's agent-loop fuses the agent into every agent/* payload
+  // (dsh-agent's agentEvents() does `{ ...payload, agent }`), and the system
+  // prompt context carries the very same instance (assembleContextFor returns
+  // { agent, scope, signal }). The agent instance is therefore the exact link
+  // between the two stages, and it is stable for the life of the session.
+  //
+  // Keying by the agent (a WeakMap) rather than by session id or turn number
+  // matters: a turn is a plain counter that repeats across sessions, and the
+  // turn payload's shape differs between entry points (some carry a session id
+  // prefix, most do not), so neither can identify a session reliably.
+  /** @type {WeakMap<object, { provider: string, model: string }>} */
+  const agentRoutes = new WeakMap();
 
   // Chain cache; invalidated when adapters change.
   let chainCache = null;
@@ -759,13 +773,24 @@ function apply(ctx, config = {}) {
    * pinned fallback is exempt from the selection skip: when the selection and
    * the fallback are the same route, it is still the end of the chain and must
    * be reachable. When nothing is left the walk returns -1.
+   *
+   * `from` is -1 when the user's own selection just failed. The walk then
+   * starts at the head of the chain — but the head is skipped when it is the
+   * route that just failed (see `failedRoute`), so the escalation lands on a
+   * DIFFERENT route instead of the same one. Without that, a selection that
+   * fails lands on chain position 0, and position 0 failing lands on position
+   * 0 again: one route carries every request until its quota is gone.
    */
-  function nextPos(chain, from, selection) {
+  function nextPos(chain, from, selection, failedRoute) {
     const last = chain.length - 1;
     for (let pos = from + 1; pos < chain.length; pos++) {
       const route = chain[pos];
       const pinned = pos === last && route.fallback === true;
       if (!pinned && selection !== undefined && sameRoute(route, selection)) continue;
+      // The route that just failed is never picked again in this walk, even
+      // when it is not cooling down (a selection that failed has no cursor
+      // position of its own, so it is not in the cooldown map yet).
+      if (!pinned && failedRoute !== undefined && sameRoute(route, failedRoute)) continue;
       if (!pinned && cooling(route)) continue;
       return pos;
     }
@@ -950,7 +975,7 @@ function apply(ctx, config = {}) {
    * route. A failover in progress replaces it, so that route wins here.
    */
   function routeProviderFor(context) {
-    const active = activeRoute();
+    const active = activeRoute(context);
     if (active !== undefined) return active.provider;
     const options = context?.agent?.options;
     if (options !== undefined && options !== null && typeof options.provider === "string") {
@@ -959,16 +984,21 @@ function apply(ctx, config = {}) {
     return undefined;
   }
 
-  /** The route currently in use, when a failover has replaced the selection. */
-  function activeRoute() {
-    for (const cur of state.values()) {
-      if (cur.pos >= 0) {
-        const chain = chainCache;
-        if (chain === null) return undefined;
-        const route = chain[cur.pos];
-        if (route !== undefined) return route;
-      }
-    }
+  /**
+   * The route currently in use for the agent the prompt is assembled for.
+   *
+   * The lookup is by the agent instance, which is the same object in the
+   * request waterfall and in the prompt context. Walking the cursor map
+   * instead would answer with whichever cursor was created first — in a
+   * profile with several live sessions that is a foreign session's route, and
+   * a per-provider rewrite (see neutralizeIdentityFor) would then be applied
+   * to the wrong provider.
+   */
+  function activeRoute(context) {
+    const agent = context?.agent;
+    if (agent === undefined || agent === null || typeof agent !== "object") return undefined;
+    const route = agentRoutes.get(agent);
+    if (route !== undefined) return route;
     return undefined;
   }
 
@@ -1026,11 +1056,17 @@ function apply(ctx, config = {}) {
       if (!resolved || !resolved.provider || !resolved.model) return resolved;
       const key = keyOf(payload.turn, payload.step);
       let cur = state.get(key);
+      // The agent this request belongs to. DSH fuses it into the payload, and
+      // the prompt for the same agent reads the route back through it.
+      const agent = payload.agent;
 
       if (cur === undefined) {
         cur = { pos: -1, selection: { provider: resolved.provider, model: resolved.model } };
         state.set(key, cur);
         const fitted = await fitReasoningEffort(resolved, cur.selection, payload.signal);
+        if (agent !== undefined && agent !== null && typeof agent === "object") {
+          agentRoutes.set(agent, { provider: fitted.provider, model: fitted.model });
+        }
         debug(
           `request step=${key} -> fitted effort=${fitted.reasoningEffort ?? "(none)"} ` +
             `provider=${fitted.provider} model=${fitted.model}`
@@ -1046,7 +1082,18 @@ function apply(ctx, config = {}) {
             `llm-failover: step ${key} -> ${route.provider}/${route.model} (pos ${cur.pos})`
           );
         }
-        return await fitReasoningEffort({ ...resolved, provider: route.provider, model: route.model }, route, payload.signal);
+        const fitted = await fitReasoningEffort(
+          { ...resolved, provider: route.provider, model: route.model },
+          route,
+          payload.signal
+        );
+        if (agent !== undefined && agent !== null && typeof agent === "object") {
+          agentRoutes.set(agent, { provider: fitted.provider, model: fitted.model });
+        }
+        return fitted;
+      }
+      if (agent !== undefined && agent !== null && typeof agent === "object") {
+        agentRoutes.set(agent, { provider: resolved.provider, model: resolved.model });
       }
       return resolved;
     },
@@ -1100,10 +1147,18 @@ function apply(ctx, config = {}) {
         };
 
       // The route that just failed: cool it down so it is not picked again.
-      // Only a route the plugin actually chose counts — the selection is what
-      // the user asked for, and cooling it would also cool the fallback when
-      // the two happen to be the same route.
-      const failed = cur.pos >= 0 ? chain[cur.pos] : undefined;
+      //
+      // A route the plugin chose (cursor position >= 0) AND the user's own
+      // selection are both cooled down. Cooling the selection used to be
+      // skipped, on the grounds that it would also cool the pinned fallback
+      // when the two are the same route — but the pinned fallback is exempt
+      // from the cooldown check in nextPos anyway, so that argument does not
+      // hold. The cost of not cooling it is much higher: a selection that
+      // failed (a rate limit, say) was retried on the very next step and hit
+      // the same limit again, so one exhausted route kept absorbing requests
+      // while the rest of the chain stayed idle.
+      const failed =
+        cur.pos >= 0 ? chain[cur.pos] : { provider: payload.provider, model: payload.model ?? "" };
       if (failed !== undefined && failed.provider !== undefined && failed.provider !== "") {
         const window = cfg.cooldownMs;
         if (typeof window === "number" && window > 0) {
@@ -1122,8 +1177,8 @@ function apply(ctx, config = {}) {
       }
 
       // Advance to the next route that is neither the selection nor cooling
-      // down.
-      const pos = nextPos(chain, cur.pos, cur.selection);
+      // down, and never the one that just failed.
+      const pos = nextPos(chain, cur.pos, cur.selection, failed);
       if (pos < 0) {
         // Walked the whole chain; nothing left. Hand back to default handling
         // (which ends the turn with the failure).
@@ -1141,6 +1196,14 @@ function apply(ctx, config = {}) {
       }
 
       const fb = chain[pos];
+      // The prompt for the retried step is assembled BEFORE the request runs,
+      // so the new route has to be recorded here — recording it only when the
+      // request is resolved would leave the prompt one step behind, and the
+      // identity rewrite would be decided against the previous route.
+      const agent = payload.agent;
+      if (agent !== undefined && agent !== null && typeof agent === "object") {
+        agentRoutes.set(agent, { provider: fb.provider, model: fb.model });
+      }
       ctx.logger?.warn?.(
         `llm-failover: ${payload.provider}/${payload.model ?? ""} failed (${code}); escalating to ${fb.provider}/${fb.model}`
       );
