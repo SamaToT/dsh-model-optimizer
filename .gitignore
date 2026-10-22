@@ -1,3 +1,9 @@
 node_modules/
 *.log
 .DS_Store
+
+# Local verification helpers: the asar extraction, the real-DSH validation
+# profile builder, and the log checkers. They are one-off tools for this
+# machine, not part of the package.
+.probe/
+.asar/

@@ -141,18 +141,40 @@ error 行里**没有 model 字段**，得用 `request-error step=...` 的 step �
    多会话时那是**别的会话**的路由 → `neutralizeIdentityFor` 作用在错的 provider 上
    → workbuddy 的签名照旧被拒（`INVALID_REQUEST`）。
 
-### 3.3 workbuddy 上游的时间线（重要背景）
+### 3.3 workbuddy 上游的时间线与真正的根因
 
 | 日期 | workbuddy 请求 | 错误 | 说明 |
 |---|---|---|---|
-| 10-20 | 540 | 45（43 RATE_LIMIT + 1 INVALID_REQUEST） | **上游还没开始校验签名** |
-| 10-21 | 23 | 21（18 INVALID_REQUEST） | **上游 10-20 末/10-21 开始校验签名** |
-| 10-22 | 26 | 1 | 方案 C 生效后基本干净 |
+| 10-20 | 540 | 45（43 RATE_LIMIT + 1 INVALID_REQUEST） | 上游当时还没开始渠道校验 |
+| 10-21 | 23 | 21（18 INVALID_REQUEST） | 上游 10-20 末/10-21 开始校验 |
+| 10-22 | 26 | 1 | 仍未解决（根因见下） |
 
-⇒ 「之前能连上」= 上游当时不查签名；「现在连不上」= 上游查了，需要中和。
-**workbuddy 插件 0.7.9 本身没有中和能力**（三个 `prepare*` 函数只要看到已有 system 就原样返回；
-grep `REJECTED_SYSTEM_SIGNATURES` / `You are an AI agent` 全空）。
-中和是本插件的 `neutralizeIdentityFor` 做的。
+**2026-10-22 晚，实测确定的真正根因**（对照实验，见 §4.1）：
+
+workbuddy 走的是 **CN 变体**（`status` 显示 `domain: www.codebuddy.cn`，
+端点 `CN_CHAT_BASE = https://copilot.tencent.com`）。CN 上游的渠道校验有
+**两个必要条件**，缺一即被拒（HTTP 400 / code 11128）：
+
+1. 第一条 system 消息的**开头**不能是 rival 身份签名
+   （`You are an AI agent powered by DeepSeek Harness.`）
+2. system 消息的 **role 必须是 `system`**——pi-ai 对 reasoning 模型发
+   `role: "developer"`，因为 `detectCompat` 对这个 baseUrl 判定
+   `supportsDeveloperRole: true`（`isNonStandard` 不含它、`isOpenRouter` 为 false）
+
+**官方 `dsh-workbuddy-connect` 0.7.9 只在国际版路径修这两件事**
+（`prepareChatBody`，`region === "global"` 时才走）；**CN 路径
+（`prepareCnChatBody`）两件都没做**，所以 DSH 的每一个 workbuddy 请求都被拒。
+停维护的 `lin666hub/dsh-workbuddy-connect-fixed` 同样漏了 CN 路径。
+npm 上 0.7.9 已是最新版，没有修复。
+
+**⇒ 本插件的 `neutralizeIdentityFor` 解决不了这个问题**，它改的是
+`harness:identity` **那一段**的文字，而上游检查的是**整条 system 消息的开头**；
+而且它无法处理 role 这一半。该功能已从 profile 配置中移除。
+
+**真正的修复在另一个插件**：`dsh-workbuddy-cn-fix`
+（`~/.dsh/plugin-src/dsh-workbuddy-cn-fix`，GitHub `SamaToT/dsh-workbuddy-cn-fix`），
+见 §4.1。
+
 
 ---
 
@@ -174,44 +196,78 @@ escalate pos=2 -> workbuddy/hy3
 
 （修复前每次都是 `pos=0`。）
 
+### 4.1 v1.6.0 修好的（commit 见 §8，tag v1.6.0）
+
+1. **§5.2 冷却窗口按失败码分级**（`DEFAULT_COOLDOWN_WINDOWS`）。
+2. **§5.3 成功/失败计数 + 持久化**（`llm/stream` 计数 → `~/.dsh/llm-failover-stats.json`）。
+3. **§5.1 链序按实测成功率加权**（档内重排，三条防抖规则）。
+4. **冷却窗口跨重启保留**（§5.6，真环境跑出来的 bug）。
+
 ---
 
-## 5. 还没解决的问题（下一版该做的）
+## 5. v1.6.0 做了什么（§5.1 / §5.2 / §5.3 已实现）
 
-### 5.1 链序不看实际成功率 —— 最大的问题
+> §5.4（escalate 粒度太粗）**没做**：一次失败就换模型会丢弃已生成的 token，
+> freeroute 那种「首个 token 到达前就切」要动 DSH 内部，风险高，留到以后。
 
-链序规则只有「免费→积分→付费」+ 价格标签（`loadRanking` 读
-`~/.dsh/our-free-model/catalog.json`，`loadPriceCatalog` 读 workbuddy 写的价目文件）。
-**成功率完全没进排序。**
+### 5.1 链序按实测成功率加权 ✅
 
-实测：`minimax/m3.1-flash:free` 384 次 0 失败，却排在
-`kilo-auto/free`（200 次 5 失败）**后面**。
+`llm/stream` 瀑布流记下每条路由的成败，链在**档内**按成功率重排。三条防抖规则：
 
-### 5.2 冷却窗口一刀切
+1. **档位本身不动**（free 永远在 credits 前）——成本顺序不被成功率打乱；
+2. **样本不足 = 未知，不是差**——按先验均值 0.5 计分，不因没数据被提到前面，
+   也不因别人失败被踢到最后；
+3. **分数量化到 `statsRankEpsilon`（默认 0.02）**——同一档内保持原相对顺序，
+   链不会每记一次结果就重排一次。
 
-`cooldownMs: 30000` 对所有错误码一样。但：
-- `RATE_LIMIT`：额度窗口是**分钟级**，30 秒后重打必然再撞
-- `INVALID_REQUEST`（签名被拒）：**永久性**，30 秒毫无意义
-- `SERVER`：30 秒合理
+> **踩过的坑（已修）**：第一版给「未知路由」打了 `prior * 0.5 = 4.0` 分，
+> 而实测成功率在 [0,1]，于是**每条没试过的路由都跳到链首**。
+> 先验的**权重**（8）和先验的**均值**（0.5）不是一回事。
 
-⇒ 需要**按失败码分级**的冷却窗口。
+### 5.2 冷却窗口按失败码分级 ✅
 
-### 5.3 插件不记成功历史
+`DEFAULT_COOLDOWN_WINDOWS` 按「这个故障要持续多久」分级：
+限流 5 分钟 / 永久性失败 30 分钟 / 服务端抖动 30 秒。
+`cooldownWindows` 配置项可以覆盖其中任意几个码，其余仍走 `cooldownMs`。
 
-384 次成功和 191 次被限流的路由在插件眼里等价。要做成功率排序，
-必须先有**持久化的成功/失败计数**。
+### 5.3 成功/失败计数 + 持久化 ✅
 
-### 5.4 escalate 粒度太粗
+- 计数点选在 `llm/stream`（**唯一能看到成功的地方**），不是
+  `agent/request-error`（只看得到失败）。
+- 存储：`~/.dsh/llm-failover-stats.json`，临时文件 + rename 写入，不会写坏。
+- 累计计数 `ok`/`bad` + 最近 `statsWindow` 条结果的位串（滑窗成功率）。
+- **失败去重**：一次失败会被 `llm/stream` 的终止 chunk 和 `agent/request-error`
+  各报一次，两处都计会让失败率虚高。用一个 5 秒的标记保证只计一次。
 
-一次失败就换模型 = 丢弃已生成的 token。
-freeroute 那种「首个 token 到达前就切」的设计本插件没有。
-（这条要动 DSH 内部，风险高，建议放到最后考虑。）
+### 5.6 顺带修掉的真 bug：冷却窗口跨重启丢失 ✅
 
-### 5.5 建议的下一版范围
+**这是真实环境跑出来的，不是想出来的。**
 
-- **v1.6.0**：分级冷却窗口 + 成功/失败计数 + 统计持久化（数据积累期）
-- **v1.6.1**：用积累的统计数据做成功率加权排序（注意排序抖动、跨会话持久化）
-- 验收标准必须是**真实 App 日志**，不是 mock
+原来的冷却表在内存里，**每次进程重启就没了**。而 §5.2 把窗口拉长到
+分钟级之后，这恰好是最不能丢的东西——App 经常重启。
+
+真环境证据（`~/.dsh/llm-failover-verify5.log`，5 个独立进程）：
+
+```
+routes re-picked inside their own cooldown window: 11
+```
+
+即：一个被判定「30 分钟内不要再碰」的路由，在**下一个进程**又被选了 11 次。
+
+修法：冷却期限和统计一起持久化（`stats.setCooldown` / `stats.cooldownUntil`），
+启动时读回。修完后真环境日志里每个进程开头都有：
+
+```
+cooldowns loaded 8 from C:\Users\Administrator\.dsh\llm-failover-stats-verify5.json
+```
+
+### 5.7 下一个版本该做的
+
+- **§5.4 escalate 粒度**（首个 token 前就切）——要动 DSH 内部，风险高。
+- **链构建竞态**：真环境日志里出现过 `chain free=8` 和 `chain free=26` 交替，
+  说明 `buildChain()` 在 provider 还在枚举模型时就把**残缺的链**缓存了。
+  需要在链构建时等 provider 的模型列表稳定，或给残缺的链加标记。
+  （这一条不修，成功率排序偶尔会用一条短的链算。）
 
 ---
 
@@ -272,17 +328,65 @@ await ctx.plugin(plugin, config);     // 启动插件，cordis 会调 plugin.app
 | 文件 | 作用 | 状态 |
 |---|---|---|
 | `verify-identity.mjs` | identity 中和（mock waterfall） | 7/7 |
-| `verify-failover-fixes.mjs` | 三个修复的源码断言（读三份副本） | 36/36 |
-| `verify-cordis-real.mjs` | **真 cordis v4 + 真插件 + 真 waterfall** | 9/9 |
+| `verify-failover-fixes.mjs` | 源码断言（读三份副本），含 §5 各项 | 123/123 |
+| `verify-cordis-real.mjs` | **真 cordis v4 + 真插件 + 真 waterfall** | 17/17 |
 
 真实 cordis 那个测试需要把插件和测试脚本复制到 `%TEMP%\cordis-real\` 再跑
 （因为插件要从自己的目录解析 schemastery）。
 
-### 6.4 用户路径的最终证据
+**`verify-cordis-real.mjs` 的两个关键写法**（别改回去）：
 
-只有 `~/.dsh/llm-failover.log` 里的 `request` / `request-error` 行
+1. **用 `ctx.events.waterfall(ctx, name, payload, inner)`，不要用 `ctx.emit()`。**
+   `ctx.emit` 不返回 waterfall 的结果，也不把 `next` 传给监听器——
+   插件的处理器里 `next()` 会是 undefined。
+2. **假 llm 的 `listModels()` 必须返回对象数组**（`{ id, name }`），不是字符串数组。
+   返回字符串的话插件一条路由都发现不了，测试会对着一条**空链**断言，
+   然后「通过」——这种假绿比失败更糟。
+
+### 6.4 真 DSH 进程验证（比 mock 强一档）
+
+`desktop` profile 由 App 管理，CLI 拒绝启动它
+（`error: profile "desktop" is managed exclusively by the Electron application`）。
+但**可以另建一个 profile** 来跑真的 DSH 进程：
+
+```sh
+# 从 asar 取出 CLI
+node extract.mjs <out> dsh/node_modules        # 取出 @deepseek-ai/dsh 等
+cd <out>/dsh/node_modules/@deepseek-ai/dsh
+HOME="$USERPROFILE" USERPROFILE="$USERPROFILE" \
+  node lib/bin.js --profile verify-5 headless "Reply with exactly the word: PONG"
+```
+
+`verify-5` profile 的做法（`.probe/make-profile.mjs`）：
+
+- `node_modules` 从 desktop profile **整份复制**（真的 provider + 真的凭据）；
+- `cordis.patch.yml` 从 desktop profile 复制，只改插件的 `debugLog` / `statsPath`，
+  并删掉 `ui-*` 那几行（Web bundle 没挂载，留着会加载失败）；
+- `package.json` 的 `dsh.profile.bundles` 只留
+  `dsh-base` / `dsh-headless` / `dsh-model-optimizer` / `dsh-our-free-model` /
+  `dsh-workbuddy-connect` / `dsh-freeroute`；
+  **不挂 `dsh-web-app`**（它启动时会开浏览器 = 3080 弹窗事故）。
+
+`headless` bundle 本身会 **disable `credentials` 和 `deepseek-account`**，
+所以它只能靠启动时的环境变量凭据；想用账号里的 provider，
+就得像上面这样自己拼一个 profile（不 disable 凭据插件）。
+
+### 6.5 用户路径的最终证据
+
+只有 `~/.dsh/llm-failover.log` 里的 `request` / `request-error` / `outcome` 行
 （App 真实请求留下的）能证明「某个 provider 能不能用」。
 注入式探测只能证明决策逻辑。
+
+v1.6.0 起，App 自己的日志里会有这些行（真实 App 请求留下的）：
+
+```
+2026-10-22T07:25:27.540Z outcome ok freeroute/auto (tool-calls) total ok=1 bad=1
+2026-10-22T07:39:51.807Z request-error step=214:9 provider=freeroute code=STREAM_CLOSED dead=false transient=false
+2026-10-22T07:26:19.743Z cooldown our-free-model/mimo-v2.6-flash-free for 1800000ms (INVALID_CREDENTIAL)
+```
+
+`outcome` 的 kind 有三种：`stop`（正常结束）、`tool-calls`（模型要调工具）、
+`error`（失败）。**`tool-calls` 算成功**——模型正常跑完了这一轮。
 
 ---
 
@@ -296,13 +400,18 @@ await ctx.plugin(plugin, config);     // 启动插件，cordis 会调 plugin.app
 | **desktop profile 由 App 管理** | `dsh plugin add --profile desktop` 会被拒。改 `package.json` 的 `dsh.profile.bundles` + `dependencies`，再装包 |
 | **改完要重启 App 才生效** | 但**不要替用户重启**（那是 3080 事故的起因） |
 | **`cordis.patch.yml` 用 edit 精确改** | 绝不 write 整体覆盖（2026-10-21 事故的直接原因：凭记忆重写把 workbuddy 的 insert 条目整条弄丢） |
+| **三份副本是硬链接** | `~/.dsh/plugin-src/dsh-model-optimizer` 和 profile 的 `node_modules/dsh-model-optimizer` 是**同一个 inode**（nlink=2），仓库那份是独立的。同步要**原地覆写**（truncate+write），删了重建会断链，profile 那份会停在旧内容上——看起来就像「装上了但没生效」 |
+| **`install_bundle` 对已装的 `file:` 包报 `already-installed`** | 这是正常的：这个包是 profile 的 `file:` 依赖，内容本来就在原地生效。`remove_bundle` 再装会把 `file:` 依赖从 profile 里摘掉，比"没报错"更糟 |
+| **App 会热加载插件代码** | 改完 `node_modules` 里的 index.js，**不用重启 App** 就生效了。v1.6.0 上线后 App 自己的 `~/.dsh/llm-failover.log` 立刻开始写 `outcome` 行 |
+| **真 DSH 进程要设 `HOME`/`USERPROFILE`** | 不设会报 `无法解析 HOME/USERPROFILE 或 DSH_HOME（launchEnvironment 缺失）` |
+| **`dsh-headless` 不在 desktop profile 里** | 它要单独从 asar 复制进验证 profile 的 `node_modules/@deepseek-ai/` |
 
 ---
 
 ## 8. Git 状态
 
 - 远程：`https://github.com/SamaToT/dsh-model-optimizer.git`
-- 分支：`main`，最新 tag **v1.5.0**（commit `7faf717`）
+- 分支：`main`，最新 tag **v1.6.0**（本会话）
 - 发布纪律：**攒够实质性改动再打 tag**，不要每个修复都发；只有致命 bug 立刻发。
 - 每版发布前必须：`README.md` + `README.en.md` 同步更新、版本号三处同步、测试全绿。
 

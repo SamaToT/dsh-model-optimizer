@@ -37,5 +37,31 @@
         preferRanked: true
         # Credits tier: try the cheapest model first (WorkBuddy price list).
         preferCheapestCredits: true
+        # The cooldown window per failure code. The built-in defaults already
+        # grade them (a rate limit waits minutes, a rejected request waits
+        # much longer, a server blip waits seconds); this map REPLACES the
+        # default for the codes it names. `cooldownMs` stays the fallback for
+        # every code that is not listed here.
+        cooldownMs: 30000
+        cooldownWindows:
+          RATE_LIMIT: 300000
+          QUOTA: 300000
+          ACCOUNT_QUOTA: 900000
+          AUTH: 1800000
+          INVALID_CREDENTIAL: 1800000
+          MISSING_CREDENTIAL: 1800000
+          AUTHORIZATION_REQUIRED: 1800000
+          INVALID_REQUEST: 1800000
+          CLIENT_ERROR: 1800000
+          NO_ADAPTER: 1800000
+          REGION_BLOCKED: 3600000
+          SERVER: 30000
+        # The measured success/failure counters. They are written here so the
+        # reliability ranking survives a restart.
+        statsPath: "~/.dsh/llm-failover-stats.json"
+        statsWindow: 50
+        statsMinSamples: 3
+        # Order the routes inside each cost tier by the measured reliability.
+        rankBySuccessRate: true
         # Write the plugin's decisions here so a switch can be inspected.
         debugLog: "~/.dsh/llm-failover.log"

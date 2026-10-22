@@ -24,6 +24,9 @@ DSH 自带的重试只会重试**同一个模型**（`@deepseek-ai/dsh-llm-retry
 - 监听官方 `agent/request-error` 瀑布流（`prepend`，先于 `dsh-llm-retry` 决策）。
 - 遇到**持续性**失败码时沿成本链走一步并返回 `{ kind: "retry" }`，让 agent 重跑该步骤。
 - 重试时覆盖 `agent/request`，使下一次请求走新路由。
+- **按失败码分级冷却**：限流等几分钟，被拒等更久，服务端抖动只等几秒。
+- **记录每条路由的成功/失败**（`llm/stream` 瀑布流），并持久化到磁盘。
+- **按实测成功率重排档内顺序**：一直失败的模型自动往后排。
 - **自动适配推理档位**（reasoning effort），避免切换后因
   `UNSUPPORTED_REASONING_EFFORT` 再次失败。
 - **让模型如实报身份**：覆盖系统提示里的 `{{provider}}` / `{{model}}` 变量，
@@ -80,6 +83,36 @@ dsh plugin --profile <你的 profile> add dsh-model-optimizer
   路由跟在有排名的后面。
 - **积分档**——按当前价格，便宜的在前。看不到价格的模型排在所有有价格模型之后。
 - **付费档**——没有公开价目，保持发现顺序。
+
+### 再按实测成功率微调（v1.6.0）
+
+上面是 provider 的**偏好**，不是**事实**。一个 30% 失败的模型照样排在 0% 失败的模型
+前面，于是每一轮都要先付一次失败的代价。
+
+插件会通过 `llm/stream` 瀑布流统计每条路由的成败（成功、失败、限流都算），
+把计数存到 `statsPath`（默认 `~/.dsh/llm-failover-stats.json`），然后在**档内**
+按成功率重排。三条约束保证它不会乱：
+
+1. **档位本身不动**——免费永远在积分前面，成本顺序不会被成功率打乱。
+2. **没试过的路由不算差**——样本不足的路由按「未知」处理，留在 catalog 给它的位置上，
+   既不因为没数据被提到前面，也不因为别人失败被踢到最后。
+3. **分数带先验、且量化到固定档位**——成功率按先验平滑（一次走运不能压过久经考验的
+   路由），且相近的分数保持原有相对顺序，链不会每记一次结果就重排一次。
+
+```yaml
+config:
+  # 统计文件位置。留空 = 只在内存里记，不落盘。
+  statsPath: "~/.dsh/llm-failover-stats.json"
+  # 用最近多少条结果算成功率。
+  statsWindow: 50
+  # 至少要多少条样本才允许影响顺序。
+  statsMinSamples: 3
+  # 关掉就退回纯 catalog 顺序。
+  rankBySuccessRate: true
+```
+
+统计是**累计**的（`ok` / `bad` 计数器），成功率则算在最近 `statsWindow` 条结果上，
+所以一个上周一直可靠的模型今天开始失败，会很快被降下去。
 
 ### 分时段免费模型
 
@@ -144,8 +177,26 @@ config:
   escalateOnTransient: false
   # 永久兜底路由：永远排链尾，它失败即止（不再 retry）。留空则用链尾那个。
   fallback: { provider: "", model: "" }
-  # 刚失败的路由在冷却期内不再被选，毫秒。0 = 关闭。
+  # 刚失败的路由在冷却期内不再被选，毫秒。0 = 关闭。这是"没被列出的码"的兜底值。
   cooldownMs: 60000
+  # 按失败码分级的冷却窗口（毫秒）。点名的码替换内置默认值。
+  cooldownWindows: {}
+  # 成功/失败计数存到哪里。留空 = 只在内存里记。
+  statsPath: "~/.dsh/llm-failover-stats.json"
+  # 统计文件多久写一次盘，毫秒。0 = 每次结果都写。
+  statsFlushMs: 5000
+  # 成功率用最近多少条结果算。
+  statsWindow: 50
+  # 至少多少条样本才允许影响顺序。
+  statsMinSamples: 3
+  # 是否按实测成功率重排档内顺序。
+  rankBySuccessRate: true
+  # 成功率平滑的先验权重（越大越保守）。
+  statsPriorWeight: 8
+  # 两个分数相差小于这个值就保持原顺序（防抖动）。
+  statsRankEpsilon: 0.02
+  # 新的统计结果最多等这么久才被用上（毫秒）。
+  statsRefreshMs: 60000
   # 对列出的 provider，把系统提示里的官方身份签名改写掉（见下文「改写官方身份签名」）。
   # 留空 = 不改任何 provider。
   neutralizeIdentityFor: []
@@ -215,14 +266,40 @@ config:
 
 这正是「链已经无能为力时，用你最信任的模型试最后一次，不行就如实说失败」，避免无限重试。
 
-### 冷却（cooldownMs）
+### 冷却（cooldownMs / cooldownWindows）
 
-刚失败过的路由在冷却期内不会被再选，默认 60 秒：
+刚失败过的路由在冷却期内不会被再选。一个**统一**的窗口对所有失败都是错的：
+
+- `RATE_LIMIT`——额度窗口是**分钟级**的，30 秒后重打必然再撞一次同样的墙；
+- `INVALID_REQUEST`（签名被拒）——**永久性**的，等多久都没用，但窗口太短会让插件
+  在下一步又撞上同一堵墙；
+- `SERVER`——30 秒就够。
+
+所以插件**按失败码分级**：
+
+| 失败码 | 默认冷却 | 理由 |
+|---|---|---|
+| `RATE_LIMIT`、`QUOTA` | 5 分钟 | 上游窗口是分钟级的 |
+| `ACCOUNT_QUOTA` | 15 分钟 | 账号额度要人去充值 |
+| `AUTH`、`INVALID_CREDENTIAL`、`MISSING_CREDENTIAL`、`AUTHORIZATION_REQUIRED` | 30 分钟 | 要人去登录/换 Key |
+| `INVALID_REQUEST`、`CLIENT_ERROR`、`NO_ADAPTER` | 30 分钟 | 永久性失败 |
+| `REGION_BLOCKED` | 1 小时 | 地区限制不会自己变 |
+| `CONTEXT_WINDOW_EXCEEDED`、`INVALID_MODEL_REASONING`、`IMAGE_OFFLOAD_REQUIRED` | 10 分钟 | 这条路由干不了这个请求 |
+| `SERVER`、`TIMEOUT`、`TRANSPORT` | 30 秒 | 抖动，很快就好 |
+| `EMPTY_RESPONSE` | 15 秒 | 抖动 |
+| 未列出的码 | `cooldownMs`（默认 60 秒） | 兜底 |
+
+覆盖其中某些码：
 
 ```yaml
 config:
-  cooldownMs: 60000   # 0 = 关闭
+  cooldownMs: 30000        # 未列出的码用这个
+  cooldownWindows:
+    RATE_LIMIT: 600000     # 改成 10 分钟
+    SERVER: 5000           # 改成 5 秒
 ```
+
+`cooldownWindows` 里点名的码会**替换**内置默认值，其余码仍走 `cooldownMs`。
 
 这样同一条链连续走多次时，不会反复撞到同一个刚坏的模型。兜底路由不受冷却影响——它永远是最后那张牌。
 

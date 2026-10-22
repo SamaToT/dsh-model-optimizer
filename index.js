@@ -40,10 +40,10 @@
 //   MISSING_CREDENTIAL / CONTEXT_WINDOW_EXCEEDED -> escalate to the next tier.
 
 import z from "@deepseek-ai/schemastery";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const name = "llm-failover";
 
@@ -138,6 +138,49 @@ const DEFAULT_ESCALATE_ON = [
   "UNKNOWN",
 ];
 
+/**
+ * The default cooldown window per failure code, in milliseconds.
+ *
+ * The classification follows how long the condition actually lasts:
+ *
+ *   - A rate limit or a quota is a WINDOW, not a moment. The upstream resets
+ *     it in minutes, so a 30 second cooldown is a guaranteed second hit.
+ *   - A rejected request is PERMANENT: a signature the gateway refuses, a
+ *     parameter the model will never accept, a model that is not served.
+ *     Waiting does not fix any of them, but a short window means the plugin
+ *     walks into the same wall on the next step, so the route is put aside
+ *     for much longer.
+ *   - A server error, a timeout, a transport blip is transient: a short wait
+ *     is exactly right, and the route is often fine again on the next step.
+ *
+ * A code that is not listed uses the global `cooldownMs`.
+ */
+const DEFAULT_COOLDOWN_WINDOWS = {
+  // The upstream's own window is minutes long; do not re-enter it early.
+  RATE_LIMIT: 300000,
+  QUOTA: 300000,
+  ACCOUNT_QUOTA: 900000,
+  // The route is broken until the user fixes it (key, login, credits).
+  AUTH: 1800000,
+  INVALID_CREDENTIAL: 1800000,
+  MISSING_CREDENTIAL: 1800000,
+  AUTHORIZATION_REQUIRED: 1800000,
+  // The route itself cannot serve this request, ever.
+  INVALID_REQUEST: 1800000,
+  CLIENT_ERROR: 1800000,
+  INVALID_MODEL_REASONING: 600000,
+  UNSUPPORTED_REASONING_EFFORT: 300000,
+  NO_ADAPTER: 1800000,
+  CONTEXT_WINDOW_EXCEEDED: 600000,
+  REGION_BLOCKED: 3600000,
+  IMAGE_OFFLOAD_REQUIRED: 600000,
+  // A short upstream blip: the route is usually fine again right away.
+  SERVER: 30000,
+  TIMEOUT: 30000,
+  TRANSPORT: 30000,
+  EMPTY_RESPONSE: 15000,
+};
+
 /** A route entry in the failover chain. */
 const Route = z.object({
   provider: z.string(),
@@ -214,6 +257,57 @@ const Config = z.object({
   // same route failing twice in a row inside the window is not retried; the
   // chain moves on immediately. 0 disables the cooldown.
   cooldownMs: z.number().step(1).min(0).default(60000),
+  // Per-failure-code cooldown windows, in milliseconds: { RATE_LIMIT: 300000 }.
+  //
+  // One flat window is wrong for every kind of failure. A rate limit lasts
+  // until the upstream's window resets — often minutes — so a 30s window means
+  // the route is retried into the same wall. A rejected request (a signature
+  // the upstream refuses, an unsupported parameter) is permanent: no window
+  // helps, and a short one makes the plugin walk into it again on the next
+  // step. A server error is worth a short wait.
+  //
+  // A code that is not listed uses `cooldownMs`. The built-in defaults are in
+  // DEFAULT_COOLDOWN_WINDOWS and are merged under the user's own entries, so
+  // naming a code here replaces the default for that code.
+  cooldownWindows: z.dict(z.number()).default({}),
+  // Where the per-route success/failure counters are kept, so the statistics
+  // survive a restart. Empty disables persistence (counters stay in memory).
+  statsPath: z.string().default(""),
+  // How often the counters are written to disk, in milliseconds. 0 writes
+  // after every outcome; the default of 5000 keeps the disk quiet. The
+  // counters are always flushed when the plugin is disposed.
+  statsFlushMs: z.number().step(1).min(0).default(5000),
+  // Use the recorded success rate to order the routes inside each cost tier.
+  //
+  // The chain order is otherwise the author's preference (the free catalog's
+  // own ranking, the price list) — but a route that fails 30% of the time
+  // stays in front of one that never fails, so the plugin keeps paying for
+  // the first failure of every turn. Weighting the order by the measured
+  // success rate moves the reliable route forward. The weighting is
+  // deliberately gentle and only applies inside a tier, so the cost order
+  // (free -> credits -> paid) is never violated.
+  rankBySuccessRate: z.boolean().default(true),
+  // How many recent outcomes one route's success rate is computed from.
+  // Small enough to follow a route that just started failing, large enough
+  // that one unlucky request does not reshuffle the chain.
+  statsWindow: z.number().step(1).min(1).default(50),
+  // A route needs at least this many recorded outcomes before its success
+  // rate is allowed to influence the order. Below that the route keeps its
+  // catalog position: an untried route is not a bad route.
+  statsMinSamples: z.number().step(1).min(0).default(3),
+  // The prior weight used to smooth the measured rate. A route with N
+  // outcomes and a rate of R is scored as (N*R + W*prior) / (N + W): the
+  // prior stands in for the outcomes a route has not had yet, so one lucky
+  // call cannot promote a route over a well-tested one.
+  statsPriorWeight: z.number().step(1).min(1).default(8),
+  // Two routes whose scores differ by less than this keep their catalog
+  // order. Without it the chain could reshuffle on every recorded outcome
+  // and the same request would take a different route each time.
+  statsRankEpsilon: z.number().step(0).min(0).default(0.02),
+  // How often the chain is rebuilt to pick up the newest measurements, in
+  // milliseconds. The chain is rebuilt on adapter changes regardless; this
+  // bounds how long a measurement may wait before it is used.
+  statsRefreshMs: z.number().step(1).min(0).default(60000),
   // Providers whose gateway refuses a system prompt that opens with a rival
   // client's identity line.
   //
@@ -564,6 +658,224 @@ function priceFromLabel(label) {
   return { tier: cost === 0 ? "free" : "credits", cost };
 }
 
+/** The statistics file format this build reads and writes. */
+const STATS_VERSION = 1;
+
+/**
+ * Per-route success/failure counters, persisted across restarts.
+ *
+ * WHY
+ *   The chain used to be ordered purely by cost tier and by the catalog's own
+ *   preference, so a route that fails 30% of the time stayed in front of one
+ *   that never fails and the plugin paid for the first failure of every turn.
+ *   Ranking by reliability needs a measurement, and a measurement that dies
+ *   with the process is worth little: the App restarts often and a fresh
+ *   counter needs dozens of requests to learn anything.
+ *
+ * THE STORE
+ *   One JSON file under the Harness home:
+ *
+ *     { "version": 1, "routes": { "provider/model": { "ok": 12, "bad": 3, "bits": "111011" } } }
+ *
+ *   `ok`/`bad` are cumulative counters; `bits` is the recent history, one
+ *   character per outcome, most recent LAST ("1" = success, "0" = failure),
+ *   capped at the window length. The success rate is computed over `bits`, so
+ *   a route that was reliable for a week and started failing today is demoted
+ *   quickly, while a route with two lucky calls is not promoted on noise.
+ */
+class RouteStats {
+  /**
+   * @param {object} options
+   * @param {string} options.path - where to persist; empty disables persistence.
+   * @param {number} options.window - how many recent outcomes the rate covers.
+   * @param {number} options.flushIntervalMs - minimum delay between two writes.
+   * @param {(line: string) => void} [options.debug] - log sink.
+   */
+  constructor(options = {}) {
+    this.path = typeof options.path === "string" ? options.path : "";
+    this.window = Number.isFinite(options.window) && options.window >= 1
+      ? Math.floor(options.window)
+      : 50;
+    // A flush interval of 0 means "write after every outcome", so the
+    // comparison is `>= 0` and not `> 0`: a 0 would otherwise be mistaken
+    // for "not configured" and silently become the default.
+    this.flushIntervalMs = Number.isFinite(options.flushIntervalMs) && options.flushIntervalMs >= 0
+      ? options.flushIntervalMs
+      : 5000;
+    this.debug = typeof options.debug === "function" ? options.debug : () => {};
+    /** @type {Map<string, { ok: number, bad: number, bits: string }>} */
+    this.routes = new Map();
+    // Route -> cooldown deadline (ms since the epoch). Persisted with the
+    // counters, because a cooldown that only lives in memory is undone by
+    // every restart — and the windows are minutes long.
+    /** @type {Map<string, number>} */
+    this.cooldowns = new Map();
+    this.dirty = false;
+    this.lastFlush = 0;
+    this.load();
+  }
+
+  /**
+   * Read the store from disk. A missing or broken file is NOT an error: the
+   * store starts empty, because a statistics file must never break the plugin.
+   */
+  load() {
+    if (this.path === "" || !existsSync(this.path)) return;
+    try {
+      const raw = JSON.parse(readFileSync(this.path, "utf8"));
+      if (raw === null || typeof raw !== "object") return;
+      if (raw.version !== STATS_VERSION) return;
+      const routes = raw.routes;
+      if (routes === null || typeof routes !== "object") return;
+      for (const [key, row] of Object.entries(routes)) {
+        if (row === null || typeof row !== "object") continue;
+        const ok = Number.isFinite(row.ok) ? row.ok : 0;
+        const bad = Number.isFinite(row.bad) ? row.bad : 0;
+        const bits = typeof row.bits === "string" ? row.bits : "";
+        this.routes.set(key, { ok, bad, bits: bits.slice(-this.window) });
+      }
+      this.debug(`stats loaded ${this.routes.size} routes from ${this.path}`);
+
+      // The cooldown deadlines survive a restart too.
+      //
+      // They have to: the windows are now MINUTES long for a rate limit and
+      // half an hour for a permanent failure, and the App is restarted often
+      // (and the validation runs are separate processes). A cooldown that
+      // only lived in memory was undone by every restart, so the plugin kept
+      // walking back into a route it had just decided was dead — which is
+      // exactly what the long windows exist to prevent.
+      const cooldowns = raw.cooldowns;
+      if (cooldowns !== null && typeof cooldowns === "object") {
+        const now = Date.now();
+        for (const [key, until] of Object.entries(cooldowns)) {
+          if (!Number.isFinite(until)) continue;
+          if (until <= now) continue; // already expired
+          this.cooldowns.set(key, until);
+        }
+        this.debug(`cooldowns loaded ${this.cooldowns.size} from ${this.path}`);
+      }
+    } catch (error) {
+      this.debug(`stats load failed (${error?.message ?? error}); starting empty`);
+    }
+  }
+
+  /**
+   * Put a route into cooldown until a deadline.
+   *
+   * @param {string} key - the route key, "provider/model".
+   * @param {number} until - the deadline in ms since the epoch.
+   */
+  setCooldown(key, until) {
+    if (typeof key !== "string" || key === "") return;
+    if (!Number.isFinite(until)) return;
+    this.cooldowns.set(key, until);
+    this.dirty = true;
+  }
+
+  /**
+   * The cooldown deadline of a route, if it is still in cooldown.
+   *
+   * @param {string} key - the route key.
+   * @returns {number | undefined} the deadline in ms since the epoch.
+   */
+  cooldownUntil(key) {
+    const until = this.cooldowns.get(key);
+    if (until === undefined) return undefined;
+    if (until <= Date.now()) {
+      this.cooldowns.delete(key);
+      this.dirty = true;
+      return undefined;
+    }
+    return until;
+  }
+
+  /**
+   * Record one outcome for a route.
+   *
+   * @param {string} key - the route key, "provider/model".
+   * @param {boolean} ok - true for a success, false for a failure.
+   */
+  record(key, ok) {
+    if (typeof key !== "string" || key === "") return;
+    let row = this.routes.get(key);
+    if (row === undefined) {
+      row = { ok: 0, bad: 0, bits: "" };
+      this.routes.set(key, row);
+    }
+    if (ok) {
+      row.ok += 1;
+      row.bits = `${row.bits}1`.slice(-this.window);
+    } else {
+      row.bad += 1;
+      row.bits = `${row.bits}0`.slice(-this.window);
+    }
+    this.dirty = true;
+  }
+
+  /**
+   * The success rate of one route over its recent outcomes.
+   *
+   * @returns {{ rate: number, samples: number }} the rate is 0..1.
+   */
+  rate(key) {
+    const row = this.routes.get(key);
+    if (row === undefined) return { rate: 0, samples: 0 };
+    const bits = row.bits;
+    if (bits === "") return { rate: 0, samples: 0 };
+    let ones = 0;
+    for (let i = 0; i < bits.length; i += 1) {
+      if (bits[i] === "1") ones += 1;
+    }
+    return { rate: ones / bits.length, samples: bits.length };
+  }
+
+  /**
+   * The cumulative counters of one route, for reporting.
+   */
+  counts(key) {
+    const row = this.routes.get(key);
+    if (row === undefined) return { ok: 0, bad: 0, samples: 0 };
+    return { ok: row.ok, bad: row.bad, samples: row.bits.length };
+  }
+
+  /**
+   * Write the store to disk when something changed.
+   *
+   * @param {boolean} [force] - write even when the interval has not elapsed.
+   * @returns {boolean} whether a write happened.
+   */
+  flush(force = false) {
+    if (!this.dirty) return false;
+    if (this.path === "") return false;
+    const now = Date.now();
+    if (!force && now - this.lastFlush < this.flushIntervalMs) return false;
+    try {
+      mkdirSync(dirname(this.path), { recursive: true });
+      const payload = {
+        version: STATS_VERSION,
+        updatedAt: new Date(now).toISOString(),
+        routes: Object.fromEntries(this.routes),
+        // Only the cooldowns that are still in the future are written: an
+        // expired deadline is dead weight, and the file stays small.
+        cooldowns: Object.fromEntries(
+          [...this.cooldowns.entries()].filter(([, until]) => until > now)
+        )
+      };
+      // Write to a sibling temp file and rename it, so a crash mid-write
+      // cannot leave a half-written statistics file behind.
+      const tmp = `${this.path}.tmp`;
+      writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+      renameSync(tmp, this.path);
+      this.dirty = false;
+      this.lastFlush = now;
+      return true;
+    } catch (error) {
+      this.debug(`stats flush failed (${error?.message ?? error})`);
+      return false;
+    }
+  }
+}
+
 function apply(ctx, config = {}) {
   const raw = config ?? {};
   // The built-in rules are defaults: a user's own rules for the same provider
@@ -586,7 +898,91 @@ function apply(ctx, config = {}) {
   const excludeModels = new Set(cfg.excludeModels ?? []);
   const neutralizeFor = new Set(cfg.neutralizeIdentityFor ?? []);
 
+  // The cooldown window per failure code. The built-in table holds the
+  // defaults; the user's own entries replace the default for the code they
+  // name, so a user who wants a 10 minute rate-limit window sets exactly
+  // that without having to restate the other codes.
+  const cooldownWindows = { ...DEFAULT_COOLDOWN_WINDOWS, ...(cfg.cooldownWindows ?? {}) };
+
+  /**
+   * The cooldown window for one failure code.
+   *
+   * @param {string} code - the failure code.
+   * @returns {number} the window in milliseconds; 0 disables the cooldown.
+   */
+  function cooldownFor(code) {
+    const specific = cooldownWindows[code];
+    if (typeof specific === "number" && Number.isFinite(specific)) return specific;
+    const global = cfg.cooldownMs;
+    return typeof global === "number" && Number.isFinite(global) ? global : 0;
+  }
+
+  /**
+   * Record one outcome of a model call, exactly once.
+   *
+   * A failed call is visible TWICE: the `llm/stream` waterfall delivers a
+   * terminal chunk whose reason is "error", and the agent loop then dispatches
+   * `agent/request-error` with the same failure. Counting both would record
+   * one failure twice and make the success rate of a failing route look
+   * better than it is.
+   *
+   * So the outcome is counted from the STREAM (the only place a success is
+   * visible at all), and the error handler only counts a failure the stream
+   * never saw: one that happened before the stream started, such as a
+   * `prepareCall` failure that never reached an adapter. The two paths are
+   * told apart by a short-lived marker: the stream records the route it
+   * counted, and the error handler skips a failure on a route the stream
+   * already reported.
+   */
+  const recentlyCounted = new Map();
+  function recordOutcome(key, ok, kind) {
+    stats.record(key, ok);
+    // The measurement changes the reliability order of the chain.
+    markStatsStale();
+    // Only a FAILURE needs the marker: the error handler is the only other
+    // place a failure is reported, so a success never has to be deduped.
+    if (!ok) recentlyCounted.set(key, Date.now());
+    const counts = stats.counts(key);
+    debug(
+      `outcome ${ok ? "ok" : "fail"} ${key} (${kind}) ` +
+        `total ok=${counts.ok} bad=${counts.bad}`
+    );
+    stats.flush();
+  }
+
+  /**
+   * Whether the stream already reported an outcome for this route.
+   *
+   * @param {string} key - the route key.
+   * @returns {boolean} true when the failure must NOT be counted again.
+   */
+  function alreadyCounted(key) {
+    const at = recentlyCounted.get(key);
+    if (at === undefined) return false;
+    // The marker is only good for a short while: a later, separate call to
+    // the same route must be counted on its own.
+    if (Date.now() - at > 5000) {
+      recentlyCounted.delete(key);
+      return false;
+    }
+    return true;
+  }
+
   const llm = ctx.get("llm");
+
+  // The measured success/failure counters, persisted so the reliability
+  // ranking survives a restart.
+  const statsPath = typeof cfg.statsPath === "string" && cfg.statsPath.trim() !== ""
+    ? expandHome(cfg.statsPath)
+    : join(homedir(), ".dsh", "llm-failover-stats.json");
+  const stats = new RouteStats({
+    path: statsPath,
+    window: cfg.statsWindow,
+    flushIntervalMs: cfg.statsFlushMs,
+    debug
+  });
+  const statsEnabled = cfg.rankBySuccessRate !== false;
+  const statsMinSamples = Number.isFinite(cfg.statsMinSamples) ? cfg.statsMinSamples : 3;
 
   // Per-(turn,step) failover cursor.
   //   pos = -1  -> using the user's selected route
@@ -633,9 +1029,35 @@ function apply(ctx, config = {}) {
   };
   ctx.on?.("llm/adapters-updated", invalidate);
 
+  // The chain is rebuilt when the adapters change. It also has to be rebuilt
+  // when a NEW MEASUREMENT arrives, because the order now depends on the
+  // measured reliability — otherwise a route that just started failing would
+  // keep its old position until the next adapter change, which may be never.
+  //
+  // The rebuild is deferred and rate-limited: every outcome marks the chain
+  // stale, and the next request rebuilds it, but not more often than
+  // `statsRefreshMs`. Rebuilding on every single outcome would reorder the
+  // chain mid-conversation and make the failover jump around.
+  let chainStale = false;
+  let lastStatsRefresh = 0;
+  const statsRefreshMs = Number.isFinite(cfg.statsRefreshMs) ? cfg.statsRefreshMs : 60000;
+  const markStatsStale = () => {
+    chainStale = true;
+  };
+  const refreshIfStale = () => {
+    if (!chainStale) return;
+    const now = Date.now();
+    if (now - lastStatsRefresh < statsRefreshMs) return;
+    lastStatsRefresh = now;
+    chainStale = false;
+    chainCache = null;
+  };
+
   /** Build (and cache) the cost-ordered chain for this installation. */
   async function buildChain() {
     if (Array.isArray(cfg.chain) && cfg.chain.length > 0) return cfg.chain;
+    // A new measurement may have changed the reliability order.
+    refreshIfStale();
     if (chainCache) return chainCache;
     if (chainBuilding) return chainBuilding;
 
@@ -739,6 +1161,77 @@ function apply(ctx, config = {}) {
       // free -> credits -> paid, preserving discovery order inside each tier.
       let chain = [...tiers.free, ...tiers.credits, ...tiers.paid];
 
+      // Reorder each tier by the measured reliability (§5.1).
+      //
+      // The order above is the author's preference, not a measurement: the free
+      // catalog's ranking and the price list say which model SHOULD be tried
+      // first, but a route that fails 30% of the time still sits in front of one
+      // that never fails, so every turn pays for the first failure. The
+      // measured success rate is the only thing that knows the difference.
+      //
+      // Three rules keep this from thrashing:
+      //   - the tiers themselves never move (free stays before credits), so the
+      //     cost order the plugin promises is never violated;
+      //   - a route with too few samples keeps its catalog position, because
+      //     an untried route is not a bad route;
+      //   - the score is smoothed with a prior, so a single lucky call cannot
+      //     outrank a well-tested route, and routes whose scores are within
+      //     `statsRankEpsilon` of each other keep their relative order.
+      if (statsEnabled) {
+        const prior = cfg.statsPriorWeight;
+        const epsilon = cfg.statsRankEpsilon;
+        // The score of one route, in a single comparable number.
+        //
+        // A route with too few samples is UNKNOWN, not bad, and the two must
+        // not be confused. An unknown route is given the prior score (0.5) —
+        // the same value a route with no evidence either way would have — so
+        // it is neither promoted above a proven route nor pushed below one
+        // that keeps failing. A measured route is scored by its rate,
+        // smoothed towards the prior so a single lucky call cannot outrank a
+        // well-tested one.
+        //
+        // The score is then QUANTIZED to `epsilon`. Quantizing makes the
+        // comparison a total order (a plain float comparison is not, and
+        // `Array.prototype.sort` with an inconsistent comparator produces a
+        // scrambled array), and it makes the order stable: two routes within
+        // one step of each other keep the catalog order, so the chain does
+        // not reshuffle on every single recorded outcome.
+        const scoreOf = (route) => {
+          const key = `${route.provider}/${route.model}`;
+          const { rate, samples } = stats.rate(key);
+          // An unknown route scores the PRIOR MEAN (0.5) — the same value a
+          // route with no evidence either way would have. It must be on the
+          // same scale as a measured rate: giving it the prior WEIGHT (8)
+          // instead would put it far above every measured route, and every
+          // untried route would jump to the head of the chain.
+          if (samples < statsMinSamples) return 0.5;
+          return (samples * rate + prior * 0.5) / (samples + prior);
+        };
+        const bucketOf = (route) => Math.round(scoreOf(route) / epsilon);
+        // The catalog position of a route, used as the tie-breaker inside a
+        // score bucket.
+        const catalogIndex = new Map();
+        for (const tier of [tiers.free, tiers.credits, tiers.paid]) {
+          tier.forEach((route, index) => {
+            catalogIndex.set(`${route.provider}/${route.model}`, index);
+          });
+        }
+        const byScore = (a, b) => {
+          const ba = bucketOf(a);
+          const bb = bucketOf(b);
+          if (ba !== bb) return bb - ba; // the higher score comes first
+          const ia = catalogIndex.get(`${a.provider}/${a.model}`) ?? 0;
+          const ib = catalogIndex.get(`${b.provider}/${b.model}`) ?? 0;
+          return ia - ib; // same bucket: the catalog order stands
+        };
+        // Array.prototype.sort is stable, so the catalog order really does
+        // survive between routes that score the same.
+        tiers.free = [...tiers.free].sort(byScore);
+        tiers.credits = [...tiers.credits].sort(byScore);
+        tiers.paid = [...tiers.paid].sort(byScore);
+        chain = [...tiers.free, ...tiers.credits, ...tiers.paid];
+      }
+
       // A configured fallback is appended and pinned: it is the last route
       // tried and a failure on it ends the turn instead of escalating again.
       const fb = cfg.fallback;
@@ -764,12 +1257,24 @@ function apply(ctx, config = {}) {
     return chainBuilding;
   }
 
-  /** Whether a route is inside its cooldown window. */
+  /**
+   * Whether a route is inside its cooldown window.
+   *
+   * The deadline is read from the PERSISTED store, not from a map that lives
+   * only in this process. The windows are minutes long (a rate limit waits
+   * five minutes, a permanent failure half an hour) and the App restarts
+   * often, so an in-memory cooldown was undone by every restart: the plugin
+   * kept walking back into a route it had just decided was dead. The
+   * in-memory map is kept as the fast path for a route cooled down in THIS
+   * process, and the store is the source of truth.
+   */
   function cooling(route) {
-    const until = cooldowns.get(`${route.provider}/${route.model}`);
+    const key = `${route.provider}/${route.model}`;
+    const until = cooldowns.get(key) ?? stats.cooldownUntil(key);
     if (until === undefined) return false;
     if (until <= Date.now()) {
-      cooldowns.delete(`${route.provider}/${route.model}`);
+      cooldowns.delete(key);
+      stats.cooldownUntil(key); // drops the expired entry from the store
       return false;
     }
     return true;
@@ -1110,7 +1615,63 @@ function apply(ctx, config = {}) {
     { prepend: true }
   );
 
-  // Decide retry/escalation. Prepended so it runs before dsh-llm-retry.
+  // Count the outcome of every model call, so the chain can be ordered by the
+  // measured reliability instead of by a guess (§5.3).
+  //
+  // WHY `llm/stream` AND NOT `agent/request-error`
+  //   `agent/request-error` only fires on a FAILURE, so it can count failures
+  //   but never successes — and a success rate needs both. `llm/stream` wraps
+  //   every call, successful or not: its terminal chunk carries the finish
+  //   reason, and a reason of kind "error" or "aborted" carries the failure.
+  //
+  //   The waterfall runs for BOTH dispatch paths: dsh-llm's `stream()` and the
+  //   prepared-call path (`preparedCall.stream()`) both end in
+  //   `streamWithRegistration()`, which is the one that runs the waterfall.
+  //
+  // WHAT IT DOES
+  //   It passes the request straight through and watches the chunks. The
+  //   chunks are forwarded unchanged, so nothing about the call is altered;
+  //   the listener only observes the terminal chunk and records the outcome.
+  const disposeStream = ctx.on(
+    "llm/stream",
+    (options, next) => {
+      const provider = options?.provider;
+      const model = options?.model;
+      const key = typeof provider === "string" && typeof model === "string"
+        ? `${provider}/${model}`
+        : undefined;
+
+      // The waterfall hands the iterable back SYNCHRONOUSLY: dsh-llm's
+      // `streamWithRegistration()` returns the result of the waterfall, and
+      // the agent loop iterates it directly with `for await`. An `async`
+      // listener would return a Promise, which is not async-iterable, and
+      // every model call would fail. So this listener is a plain function
+      // that returns a generator.
+      const iterator = next();
+      if (key === undefined) return iterator;
+
+      // A generator that forwards every chunk and records the terminal one.
+      async function* observed() {
+        let outcome;
+        for await (const chunk of iterator) {
+          // The terminal chunk carries the finish reason.
+          if (chunk !== null && typeof chunk === "object" && chunk.type === "finish") {
+            outcome = chunk.reason;
+          }
+          yield chunk;
+        }
+        // No terminal chunk at all: the stream ended early. That is not a
+        // route failure (the abort path is reported by the loop itself), so
+        // nothing is recorded.
+        if (outcome === undefined) return;
+        const ok = outcome.kind !== "error" && outcome.kind !== "aborted";
+        recordOutcome(key, ok, outcome.kind);
+      }
+      return observed();
+    }
+  );
+
+
   const disposeError = ctx.on(
     "agent/request-error",
     async (payload, next) => {
@@ -1200,10 +1761,36 @@ function apply(ctx, config = {}) {
       // that does not exist and the failed one would stay eligible.
       const failed = cur.pos >= 0 ? chain[cur.pos] : cur.selection;
       if (failed !== undefined && failed.provider !== undefined && failed.provider !== "") {
-        const window = cfg.cooldownMs;
+        // The window depends on HOW the route failed (§5.2). A rate limit
+        // lasts until the upstream's own window resets — minutes — so a flat
+        // 30 second cooldown only guarantees a second hit. A rejected request
+        // is permanent: waiting does not help, but a short window means the
+        // plugin walks into the same wall on the very next step.
+        const window = cooldownFor(code);
         if (typeof window === "number" && window > 0) {
-          cooldowns.set(`${failed.provider}/${failed.model}`, Date.now() + window);
-          debug(`cooldown ${failed.provider}/${failed.model} for ${window}ms`);
+          const until = Date.now() + window;
+          const key = `${failed.provider}/${failed.model}`;
+          cooldowns.set(key, until);
+          // The deadline also goes into the persisted store, so the cooldown
+          // survives a restart. Without this the window was undone by every
+          // restart — and the window is exactly what keeps the plugin from
+          // walking back into a route that just failed.
+          stats.setCooldown(key, until);
+          stats.flush();
+          debug(`cooldown ${key} for ${window}ms (${code})`);
+        }
+
+        // Count the failure, unless the stream already counted it.
+        //
+        // A call that reached the adapter reports its failure TWICE: the
+        // `llm/stream` waterfall delivers a terminal error chunk, and the loop
+        // then dispatches `agent/request-error` with the same failure. The
+        // stream is the one that counts, and this handler only counts the
+        // failures the stream never saw — a `prepareCall` failure, or a
+        // failure raised before the adapter was reached.
+        const failedKey = `${failed.provider}/${failed.model}`;
+        if (!alreadyCounted(failedKey)) {
+          recordOutcome(failedKey, false, code);
         }
       }
 
@@ -1258,9 +1845,13 @@ function apply(ctx, config = {}) {
     disposeError();
     disposeAssemble();
     disposePreStep();
+    disposeStream();
     state.clear();
     cooldowns.clear();
     retryCounts.clear();
+    // Write the counters out before the plugin goes away, so a restart does
+    // not lose what was measured.
+    stats.flush(true);
     invalidate();
   }, "llm-failover: dispose listeners");
 }

@@ -49,7 +49,15 @@ for (const copy of copies) {
     "不再从 error payload 取 model",
     !/cur\.selection\s*:\s*\{\s*provider: payload\.provider, model: payload\.model/.test(src),
   );
-  check("冷却写入发生在 failed 定义之后", src.indexOf("cooldowns.set(") > src.indexOf("const failed ="));
+  // The cooldown must be written AFTER `failed` is known — the route that
+  // failed decides the key. The check is anchored on the error handler's
+  // own block, not on the first "cooldowns.set(" in the file (the persistent
+  // store has one of its own).
+  const errorHandler = src.slice(src.indexOf('ctx.on(\n    "agent/request-error"'));
+  check(
+    "冷却写入发生在 failed 定义之后",
+    errorHandler.indexOf("cooldowns.set(key, until);") > errorHandler.indexOf("const failed ="),
+  );
 
   console.log("");
   console.log("--- 1b. cursor key 必须区分会话 ---");
@@ -73,6 +81,46 @@ for (const copy of copies) {
   check("不再依赖 turn 字符串格式", !src.includes("function sessionIdOf"));
   check("agent/request 记录 agentRoutes", /agentRoutes\.set\(agent/.test(src));
   check("escalate 记录 agentRoutes（prompt 早于 request）", /agentRoutes\.set\(agent, \{ provider: fb\.provider/.test(src));
+
+  console.log("");
+  console.log("--- 4. §5.2 冷却窗口按失败码分级 ---");
+  check("存在按失败码的默认窗口表", /const DEFAULT_COOLDOWN_WINDOWS = \{/.test(src));
+  check("限流的窗口是分钟级", /RATE_LIMIT: 300000/.test(src));
+  check("永久性失败的窗口更长", /INVALID_REQUEST: 1800000/.test(src));
+  check("瞬态错误的窗口是秒级", /SERVER: 30000/.test(src));
+  check("冷却取窗口时按 code 查表", /function cooldownFor\(code\)/.test(src) && /cooldownWindows\[code\]/.test(src));
+  check("写入冷却时用的是分级窗口", /const window = cooldownFor\(code\)/.test(src));
+  check("用户的窗口覆盖内置默认值", /\{ \.\.\.DEFAULT_COOLDOWN_WINDOWS, \.\.\.\(cfg\.cooldownWindows \?\? \{\}\) \}/.test(src));
+
+  console.log("");
+  console.log("--- 5. §5.3 成功/失败计数（llm/stream） ---");
+  check("监听 llm/stream 瀑布流", /ctx\.on\(\s*"llm\/stream"/.test(src));
+  check("llm/stream 监听器不是 async（瀑布流同步返回可迭代对象）",
+    /"llm\/stream",\s*\n\s*\(options, next\) =>/.test(src) && !/"llm\/stream",\s*\n\s*async \(options, next\) =>/.test(src));
+  check("统计存储是持久化的", /class RouteStats/.test(src) && /this\.routes = new Map\(\)/.test(src));
+  check("统计文件带版本号", /const STATS_VERSION = 1/.test(src));
+  check("写入用临时文件 + rename（不会写坏）", /renameSync\(tmp, this\.path\)/.test(src));
+  check("成功与失败都计数", /stats\.record\(key, ok\)/.test(src));
+  check("失败不会被流和错误处理器重复计数", /function alreadyCounted\(key\)/.test(src) && /!alreadyCounted\(failedKey\)/.test(src));
+
+  console.log("");
+  console.log("--- 6. §5.1 按成功率重排 ---");
+  check("成功率可配置开关", /rankBySuccessRate: z\.boolean\(\)/.test(src));
+  check("档内按分数排序", /const byScore = \(a, b\) =>/.test(src));
+  check("档位本身不参与重排（成本顺序不被打破）",
+    /tiers\.free = \[\.\.\.tiers\.free\]\.sort\(byScore\)/.test(src) &&
+    /tiers\.credits = \[\.\.\.tiers\.credits\]\.sort\(byScore\)/.test(src));
+  check("样本不足的路由按 0.5（未知）处理，不被当成差路由",
+    /if \(samples < statsMinSamples\) return 0\.5;/.test(src));
+  check("分数被量化（保证比较是全序，防抖动）", /Math\.round\(scoreOf\(route\) \/ epsilon\)/.test(src));
+  check("新统计会让链失效并重建", /markStatsStale\(\)/.test(src) && /chainStale = false;/.test(src));
+
+  console.log("");
+  console.log("--- 7. 冷却窗口跨重启保留 ---");
+  check("冷却期限写入持久化存储", /stats\.setCooldown\(key, until\)/.test(src));
+  check("冷却判定读持久化存储", /stats\.cooldownUntil\(key\)/.test(src));
+  check("持久化文件保存未过期的冷却期限", /cooldowns: Object\.fromEntries/.test(src));
+  check("启动时读回冷却期限", /cooldowns loaded/.test(src));
 
   console.log("");
 }

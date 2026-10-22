@@ -1,196 +1,292 @@
-// 真实 cordis 瀑布流测试：用真的 cordis + 真的插件，注入一个假的 llm 服务，
-// 触发真的 agent/request-error 事件，验证 escalate 落点。
+// Real-cordis v4 harness for the §5 features.
 //
-// 修复前：手选模型失败 -> escalate 到 pos=0（永远同一个模型）
-// 修复后：escalate 到不同的 pos，且失败路由进入冷却
-import { createRequire } from "node:module";
+// This runs the REAL plugin inside a REAL cordis v4 context, with a fake `llm`
+// service, and drives the REAL waterfalls. It is the same shape the DSH
+// runtime uses:
+//
+//   ctx.waterfall("agent/request",        payload, seed)
+//   ctx.waterfall("llm/stream",           request, adapterStream)
+//   ctx.waterfall("agent/request-error",  payload, () => undefined)
+//
+// It asserts the §5 behaviour against what the plugin actually logs, because
+// `ctx.emit` does not return a waterfall result.
+//
+// The §5 features under test:
+//   5.2  the cooldown window depends on the failure code
+//   5.3  the success/failure counters are recorded and persisted
+//   5.1  the chain is ordered by the measured success rate
+//
+// Run: node verify-cordis-real.mjs
+
 import path from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, rmSync, mkdirSync, copyFileSync } from "node:fs";
 
-const require = createRequire(import.meta.url);
 const tmp = path.join(homedir(), "AppData", "Local", "Temp", "cordis-real");
-const cordisMod = await import(pathToFileURL(path.join(tmp, "node_modules", "@deepseek-ai", "cordis", "lib", "index.js")).href);
+const cordisMod = await import(
+  pathToFileURL(path.join(tmp, "node_modules", "@deepseek-ai", "cordis", "lib", "index.js")).href
+);
 const { Context } = cordisMod;
 
-const pluginPath = path.resolve("index.js");
-const plugin = await import(pathToFileURL(pluginPath).href);
+// The plugin is COPIED into the temp directory before it is imported.
+//
+// This is not a convenience: the plugin imports "@deepseek-ai/schemastery",
+// and Node resolves that bare specifier by walking up from the file's own
+// directory. The workspace has no node_modules, so the import would fail
+// there. The temp directory does have one, so the copy resolves — exactly the
+// way the real profile resolves it from
+// ~/.dsh/profiles/desktop/node_modules/dsh-model-optimizer.
+//
+// The copy is taken fresh on every run, so the test always exercises the
+// current source and never a stale copy.
+const pluginCopy = path.join(tmp, "plugin-index.js");
+copyFileSync(path.resolve("index.js"), pluginCopy);
+const plugin = await import(pathToFileURL(pluginCopy).href);
 
-const logPath = path.join(homedir(), ".dsh", "fixcheck-cordis.log");
+const workDir = path.join(tmp, "verify-5");
+mkdirSync(workDir, { recursive: true });
+const logPath = path.join(workDir, "llm-failover.log");
+const statsPath = path.join(workDir, "stats.json");
 rmSync(logPath, { force: true });
+rmSync(statsPath, { force: true });
 
-let pass = 0, fail = 0;
+let pass = 0;
+let fail = 0;
 const check = (name, ok, detail = "") => {
-  if (ok) { pass++; console.log(`  PASS ${name}`); }
-  else { fail++; console.log(`  FAIL ${name}${detail ? "  -> " + detail : ""}`); }
+  if (ok) { pass += 1; console.log(`  PASS ${name}`); }
+  else { fail += 1; console.log(`  FAIL ${name}${detail ? "  -> " + detail : ""}`); }
 };
 
-// A fake llm service: three providers, each with a couple of models.
+const readLog = () => (existsSync(logPath) ? readFileSync(logPath, "utf8") : "");
+
+// ---------------------------------------------------------------------------
+// The fake llm service.
+//
+// It is the same three-method surface the real DSH runtime exposes to a
+// plugin: listProviders(), listModels(provider), resolveModelInfo(p, m).
+//
+// listModels returns OBJECTS, not bare strings: the real DSH llm service
+// returns model records with an `id` and a display `name`, and the plugin
+// reads `model.id` and `model.name` (the name carries the price label). A
+// fake that returned strings would make the plugin discover zero routes, and
+// the test would then assert against an empty chain.
+// ---------------------------------------------------------------------------
 const PROVIDERS = {
   "our-free-model": ["kilo-auto/free", "minimax/minimax-m3.1-flash:free"],
-  "workbuddy": ["hy3", "step-5-preview"],
-  freestuff: ["m1", "m2"],
+  workbuddy: ["hy3", "step-5-preview"],
+  freestuff: ["m1", "m2"]
 };
 
 const ctx = new Context();
-const llm = {
-  async listProviders() { return Object.keys(PROVIDERS); },
-  async listModels(provider) { return PROVIDERS[provider] ?? []; },
-  async resolveModelInfo(provider, model) {
-    return { provider, model, efforts: ["off", "low", "medium", "high"] };
+ctx.provide("llm", {
+  async listProviders() {
+    return Object.keys(PROVIDERS).map((id) => ({ id }));
   },
-};
-ctx.provide("llm", llm);
+  async listModels(provider) {
+    return (PROVIDERS[provider] ?? []).map((id) => ({ id, name: id }));
+  },
+  async resolveModelInfo(provider, model) {
+    return { provider, model, reasoning: { efforts: [{ id: "off" }, { id: "low" }], defaultEffort: "off" } };
+  }
+});
 
 const config = {
-  chain: [
-    { provider: "our-free-model", model: "kilo-auto/free" },
-    { provider: "our-free-model", model: "minimax/minimax-m3.1-flash:free" },
-    { provider: "workbuddy", model: "hy3" },
-    { provider: "workbuddy", model: "step-5-preview" },
-    { provider: "freestuff", model: "m1" },
-  ],
+  // No explicit `chain`: the chain is DISCOVERED from the providers, which is
+  // the path the reliability ordering applies to. An explicit chain is
+  // returned verbatim and is never reordered, so testing the reorder against
+  // one would test nothing.
+  //
+  // The catalog paths point at files that DO NOT EXIST, so the test does not
+  // read the machine's real free-model ranking or the real WorkBuddy price
+  // list. Without this the tiers would depend on whatever is installed on
+  // this computer, and the test would pass or fail for reasons that have
+  // nothing to do with the plugin.
+  rankingCatalogPath: path.join(workDir, "no-such-ranking.json"),
+  workBuddyCatalogPath: path.join(workDir, "no-such-price.json"),
+  availabilityPath: path.join(workDir, "no-such-availability.json"),
   cooldownMs: 30000,
   retriesBeforeSwitch: 0,
   escalateOnTransient: true,
-  escalateOn: ["RATE_LIMIT", "INVALID_REQUEST", "SERVER", "QUOTA"],
+  escalateOn: ["RATE_LIMIT", "INVALID_REQUEST", "SERVER", "QUOTA", "AUTH"],
   debugLog: logPath,
-  neutralizeIdentityFor: ["workbuddy"],
+  statsPath,
+  statsWindow: 10,
+  statsMinSamples: 2,
+  statsRefreshMs: 0,
+  statsFlushMs: 0,
+  neutralizeIdentityFor: ["workbuddy"]
 };
 
-// cordis v4: ctx.plugin(plugin, config) starts the plugin and calls its
-// apply(ctx, config) once the injected services exist.
 await ctx.plugin(plugin, config);
 
-console.log("=== A. 手选模型失败 -> escalate 不应落在 pos=0 ===");
-// The user selected our-free-model/kilo-auto/free, which IS chain[0].
-// Simulate: that route fails. The escalation must not land on it again.
-const key = "session-cordis-check|1";
-const turn = 1;
-const step = 1;
-// The agent instance identifies the session, exactly as DSH does (the agent's
-// id IS the session id, and the agent is fused into every agent/* payload).
-const agentMain = { id: "session-cordis-check", options: { provider: "our-free-model", model: "kilo-auto/free" } };
+const events = ctx.events;
 
-// DSH's agent/request-error payload carries { turn, step, provider, failure,
-// retryPolicy, signal, agent } — it has NO model field. Emitting it with a
-// model would let the plugin "remember" a route that DSH never told it, and
-// the bug this test exists for (a half-empty route like "workbuddy/") would
-// stay hidden.
-const failRoute = async (provider, code = "RATE_LIMIT", agent = agentMain) => {
-  // ctx.emit does not return the waterfall result, so the decision is captured
-  // from the payload the plugin logs.
-  await ctx.emit("agent/request-error", {
-    turn, step, signal: undefined,
-    provider,
-    failure: { code },
-    ...(agent === undefined ? {} : { agent }),
-  });
-};
-
-// The selection is registered by the request stage first, the way DSH does it.
-await ctx.emit("agent/request", { turn, step, signal: undefined, agent: agentMain }, async () => ({
-  provider: "our-free-model", model: "kilo-auto/free",
-}));
-
-await failRoute("our-free-model");
-
-// Read back which route the plugin picked: fire agent/request and capture the
-// resolved config from inside the waterfall.
-let requested;
-await ctx.emit("agent/request", { turn, step, signal: undefined, agent: agentMain }, async () => {
-  requested = { provider: "our-free-model", model: "kilo-auto/free" };
-  return requested;
-});
-// The plugin overrides the resolved value, so read it back through a second
-// pass that observes the result of the waterfall chain.
-const { readFileSync, existsSync } = await import("node:fs");
-const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
-
-const escalateLine = (log.match(/escalate pos=(\d+) -> (\S+)/) ?? []);
-const escalatePos = escalateLine[1] !== undefined ? Number(escalateLine[1]) : -1;
-const escalateTo = escalateLine[2];
-
-check("escalate 落点不是 0（修复前恒为 0）", escalatePos >= 1, `pos=${escalatePos} -> ${escalateTo}`);
-check("escalate 选中的不是刚失败的那条路由", escalateTo !== "our-free-model/kilo-auto/free", escalateTo);
-check("日志里有 cooldown 记录（失败路由进入冷却）", /cooldown our-free-model\/kilo-auto\/free/.test(log),
-  (log.match(/cooldown \S+/g) || []).join(" | "));
-
-console.log("");
-console.log("=== B. 链上多个模型轮换，不会永远压一个 ===");
-// Fail the escalated route too: the next escalation must move further down.
-await failRoute("our-free-model");
-const logAfter = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
-const allEscalations = (logAfter.match(/escalate pos=(\d+) -> (\S+)/g) || []);
-const positions = allEscalations.map((l) => Number(/escalate pos=(\d+)/.exec(l)[1]));
-check("第二次 escalate 落到了更靠后的位置", positions.length >= 2 && positions[1] > positions[0],
-  allEscalations.join(" | "));
-check("每次 escalate 都前进（不重复落点）", new Set(positions).size === positions.length,
-  allEscalations.join(" | "));
-check("每个失败的路由都进了冷却",
-  (logAfter.match(/cooldown our-free-model\//g) || []).length >= 2,
-  (logAfter.match(/cooldown \S+/g) || []).join(" | "));
-
-console.log("");
-console.log("=== C. 中和判定按 session 精确定位 ===");
-// Two sessions with different routes. The prompt for session B must be judged
-// against B's route, not A's.
-const agentA = { id: "session-A", options: { provider: "workbuddy", model: "hy3" } };
-const agentB = { id: "session-B", options: { provider: "freestuff", model: "m1" } };
-
-await ctx.emit("agent/request", { turn: 1, step: 1, signal: undefined, agent: agentA }, async () => ({
-  provider: "workbuddy", model: "hy3",
-}));
-await ctx.emit("agent/request", { turn: 1, step: 1, signal: undefined, agent: agentB }, async () => ({
-  provider: "freestuff", model: "m1",
-}));
-
-const before = logAfter.length;
-await ctx.emit("system-prompt/assemble", { sections: [{ name: "harness:identity", text: "You are an AI agent powered by DeepSeek Harness." }] }, { agent: agentA }, async () => ({ sections: [{ name: "harness:identity", text: "You are an AI agent powered by DeepSeek Harness." }] }));
-await ctx.emit("system-prompt/assemble", { sections: [{ name: "harness:identity", text: "You are an AI agent powered by DeepSeek Harness." }] }, { agent: agentB }, async () => ({ sections: [{ name: "harness:identity", text: "You are an AI agent powered by DeepSeek Harness." }] }));
-const after = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
-const newLines = after.slice(before).split("\n").filter((l) => l.includes("neutralized"));
-check("只有 workbuddy 那个 session 触发了中和", newLines.length === 1,
-  `新增 ${newLines.length} 条: ${newLines.join(" | ")}`);
-check("中和记录指向 workbuddy", newLines.some((l) => l.includes("workbuddy")), newLines.join(" | "));
-
-console.log("");
-console.log("=== D. escalate 后，下一次 assemble 立刻反映新路由 ===");
-// The prompt is assembled BEFORE the request runs, so the escalation has to
-// update the session's route at escalation time — not when the next request
-// is resolved. A prompt that is one step behind decides the identity rewrite
-// against the previous route.
+// ---------------------------------------------------------------------------
+// A waterfall helper that mirrors the DSH runtime.
 //
-// The invariant is that the provider the rewrite is decided on is the provider
-// the escalation landed on, whatever that provider happens to be.
-const agentC = { id: "session-C", options: { provider: "workbuddy", model: "hy3" } };
-await ctx.emit("agent/request", { turn: 1, step: 1, signal: undefined, agent: agentC }, async () => ({
-  provider: "workbuddy", model: "hy3",
-}));
-// Escalate away from workbuddy.
-await ctx.emit("agent/request-error", {
-  turn: "session-C|1", step: 1, provider: "workbuddy", model: "hy3",
-  failure: { code: "INVALID_REQUEST" }, signal: undefined, agent: agentC,
+// `ctx.events.waterfall(this, name, ...args, inner)` is the real cordis
+// waterfall: the listeners run outermost-first and the last argument is the
+// innermost `next`.
+// ---------------------------------------------------------------------------
+const waterfall = (name, payload, inner) => events.waterfall(ctx, name, payload, inner);
+
+console.log("=== A. §5.2 the cooldown window depends on the failure code ===");
+
+const agentA = { id: "session-A", options: { provider: "our-free-model", model: "kilo-auto/free" } };
+
+// Register the selection the way the request stage does.
+await waterfall("agent/request", { turn: 1, step: 1, signal: undefined, agent: agentA },
+  async () => ({ provider: "our-free-model", model: "kilo-auto/free" }));
+
+// A rate limit: the window must be the LONG one (the upstream resets in
+// minutes), not the flat 30s default.
+await waterfall("agent/request-error", {
+  turn: 1, step: 1, provider: "our-free-model",
+  failure: { code: "RATE_LIMIT" }, signal: undefined, agent: agentA
 }, async () => undefined);
 
-const logBeforeD = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
-// The LAST escalation is this session's one; earlier lines belong to the
-// other sessions in this file.
-const escalateLines = logBeforeD.match(/escalate pos=\d+ -> \S+/g) || [];
-const escalateTarget = (escalateLines[escalateLines.length - 1] ?? "").match(/-> ([^/]+)\//)?.[1];
-await ctx.emit("system-prompt/assemble", { sections: [{ name: "harness:identity", text: "You are an AI agent powered by DeepSeek Harness." }] }, { agent: agentC }, async () => ({ sections: [{ name: "harness:identity", text: "You are an AI agent powered by DeepSeek Harness." }] }));
-const afterD = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
-const newD = afterD.slice(logBeforeD.length).split("\n").filter((l) => l.includes("neutralized"));
-const decided = (newD[0] ?? "").match(/for provider (\S+)/)?.[1];
-const neutralized = ["workbuddy"];
-if (escalateTarget !== undefined && neutralized.includes(escalateTarget)) {
-  check("中和判定与 escalate 目标一致", decided === escalateTarget,
-    `escalate 到 ${escalateTarget}，中和判定 ${decided}`);
-} else {
-  check("escalate 目标不在中和列表时不做中和", newD.length === 0,
-    `escalate 到 ${escalateTarget}，新增 ${newD.length} 条: ${newD.join(" | ")}`);
+let log = readLog();
+const rateLimitCooldown = (log.match(/cooldown our-free-model\/kilo-auto\/free for (\d+)ms \(RATE_LIMIT\)/) ?? [])[1];
+check("RATE_LIMIT 的冷却窗口比默认 30s 长", rateLimitCooldown !== undefined && Number(rateLimitCooldown) > 30000,
+  `window=${rateLimitCooldown}ms`);
+check("RATE_LIMIT 的冷却窗口是 5 分钟（默认值）", rateLimitCooldown === "300000", `window=${rateLimitCooldown}ms`);
+
+// A rejected request: permanent, so it must be longer than a rate limit.
+const agentB = { id: "session-B", options: { provider: "our-free-model", model: "minimax/minimax-m3.1-flash:free" } };
+await waterfall("agent/request", { turn: 1, step: 1, signal: undefined, agent: agentB },
+  async () => ({ provider: "our-free-model", model: "minimax/minimax-m3.1-flash:free" }));
+await waterfall("agent/request-error", {
+  turn: 1, step: 1, provider: "our-free-model",
+  failure: { code: "INVALID_REQUEST" }, signal: undefined, agent: agentB
+}, async () => undefined);
+
+log = readLog();
+const invalidRequestCooldown = (log.match(/cooldown our-free-model\/minimax\/minimax-m3\.1-flash:free for (\d+)ms \(INVALID_REQUEST\)/) ?? [])[1];
+check("INVALID_REQUEST 的冷却窗口比 RATE_LIMIT 长（永久性失败）",
+  invalidRequestCooldown !== undefined && Number(invalidRequestCooldown) > Number(rateLimitCooldown),
+  `window=${invalidRequestCooldown}ms vs ${rateLimitCooldown}ms`);
+
+console.log("");
+console.log("=== B. §5.3 the counters are recorded and persisted ===");
+
+// Drive a real `llm/stream` waterfall: the plugin's listener must see the
+// terminal chunk and record the outcome.
+const streamRequest = (provider, model, kind) => {
+  const chunks = [
+    { type: "text", text: "hello" },
+    { type: "finish", reason: kind === "ok" ? { kind: "stop" } : { kind: "error", failure: { code: "SERVER", message: "boom" } } }
+  ];
+  return waterfall("llm/stream", { provider, model, messages: [] }, () => ({
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk;
+    }
+  }));
+};
+
+const consumed = async (iterable) => {
+  const out = [];
+  for await (const chunk of iterable) out.push(chunk);
+  return out;
+};
+
+const okStream = await streamRequest("our-free-model", "kilo-auto/free", "ok");
+const okChunks = await consumed(okStream);
+check("成功的一次调用原样透传了所有 chunk", okChunks.length === 2, `chunks=${okChunks.length}`);
+check("终止 chunk 的 kind 原样透传", okChunks[1]?.reason?.kind === "stop", JSON.stringify(okChunks[1]));
+
+const failStream = await streamRequest("workbuddy", "hy3", "fail");
+await consumed(failStream);
+
+log = readLog();
+check("成功被记为 ok", /outcome ok our-free-model\/kilo-auto\/free \(stop\)/.test(log),
+  (log.match(/outcome \S+ \S+ \([^)]+\)/g) || []).join(" | "));
+check("失败被记为 fail", /outcome fail workbuddy\/hy3 \(error\)/.test(log),
+  (log.match(/outcome \S+ \S+ \([^)]+\)/g) || []).join(" | "));
+
+// The counters must be on disk.
+//
+// The file is read HERE, right after the first pair of outcomes, so the
+// assertion is about those two outcomes and not about the ones the later
+// section records.
+check("统计文件已写入", existsSync(statsPath), statsPath);
+if (existsSync(statsPath)) {
+  const raw = JSON.parse(readFileSync(statsPath, "utf8"));
+  const kilo = raw.routes?.["our-free-model/kilo-auto/free"];
+  const hy3 = raw.routes?.["workbuddy/hy3"];
+  check("成功计数落盘 (kilo ok=1)", kilo?.ok === 1, JSON.stringify(kilo));
+  check("失败计数落盘 (hy3 bad=1)", hy3?.bad === 1, JSON.stringify(hy3));
+  check("统计文件带版本号", raw.version === 1, JSON.stringify(raw.version));
+  // The recent-outcome bits are what the sliding success rate is computed
+  // from. The kilo route has TWO outcomes by now: the RATE_LIMIT failure
+  // from section A and the success from section B — both are real, and both
+  // are counted exactly once.
+  check("统计文件记录了近期结果位（用于滑窗成功率）",
+    typeof kilo?.bits === "string" && kilo.bits.length === 2 && kilo.bits === "01",
+    JSON.stringify(kilo));
+  check("失败只被计一次（流与错误处理器不会重复计数）",
+    kilo?.bad === 1 && hy3?.bad === 1,
+    `kilo=${JSON.stringify(kilo)} hy3=${JSON.stringify(hy3)}`);
 }
+
+console.log("");
+console.log("=== C. §5.1 the chain is ordered by the measured success rate ===");
+
+// Record enough outcomes to move a route: `workbuddy/hy3` fails, the free
+// models succeed. Then the chain must put the free models first.
+//
+// The stats window is 10 and the minimum sample count is 2, so a route needs
+// two outcomes before its rate counts.
+for (let i = 0; i < 4; i += 1) {
+  await consumed(await streamRequest("workbuddy", "hy3", "fail"));
+}
+for (let i = 0; i < 4; i += 1) {
+  await consumed(await streamRequest("our-free-model", "kilo-auto/free", "ok"));
+}
+for (let i = 0; i < 4; i += 1) {
+  await consumed(await streamRequest("our-free-model", "minimax/minimax-m3.1-flash:free", "ok"));
+}
+
+// Force a chain rebuild: the refresh interval is 0 in this config, so the
+// next buildChain() re-sorts.
+const agentC = { id: "session-C", options: { provider: "freestuff", model: "m1" } };
+await waterfall("agent/request", { turn: 9, step: 9, signal: undefined, agent: agentC },
+  async () => ({ provider: "freestuff", model: "m1" }));
+
+log = readLog();
+const chainLines = log.match(/chain free=[\s\S]*?:: (.*)/g) || [];
+const lastChain = chainLines[chainLines.length - 1] ?? "";
+const order = (lastChain.match(/([a-z-]+\/[^\s>]+)/g) || []);
+check("链序按成功率重排：workbuddy/hy3 掉到 free 两条之后",
+  order.indexOf("workbuddy/hy3") > order.indexOf("our-free-model/kilo-auto/free"),
+  `chain order: ${order.join(" > ")}`);
+check("链序按成功率重排：minimax 排在 hy3 之前",
+  order.indexOf("our-free-model/minimax/minimax-m3.1-flash:free") < order.indexOf("workbuddy/hy3"),
+  `chain order: ${order.join(" > ")}`);
+
+console.log("");
+console.log("=== D. the cost tiers never move (free stays before credits) ===");
+
+// The tier of every route, as the plugin classifies it with the built-in
+// rules: our-free-model is free, workbuddy is credits, and an unknown
+// provider is "paid" (the conservative default — never treat a third-party
+// key as free).
+const tierOf = (key) => {
+  const provider = key.split("/")[0];
+  if (provider === "our-free-model") return 0; // free
+  if (provider === "workbuddy") return 1;      // credits
+  return 2;                                   // paid
+};
+const tierOrder = order.map(tierOf);
+const isSorted = tierOrder.every((tier, index) => index === 0 || tier >= tierOrder[index - 1]);
+check("成本层顺序没有被成功率打乱（free -> credits -> paid）", isSorted,
+  `tiers: ${tierOrder.join(",")} for ${order.join(" > ")}`);
+
+// And the counts the plugin itself reported must agree with that.
+const tierCounts = (lastChain.match(/free=(\d+) credits=(\d+) paid=(\d+)/) ?? []).slice(1).map(Number);
+check("插件报告的层计数与链长一致",
+  tierCounts.length === 3 && tierCounts.reduce((a, b) => a + b, 0) === order.length,
+  `free=${tierCounts[0]} credits=${tierCounts[1]} paid=${tierCounts[2]} chain=${order.length}`);
 
 console.log("");
 console.log(`结果: ${pass} 通过, ${fail} 失败`);

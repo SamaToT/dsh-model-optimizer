@@ -29,6 +29,12 @@ free  →  credits  →  paid
 - On a *durable* failure code it walks a cost-ordered chain and returns
   `{ kind: "retry" }`, which makes the agent loop re-run the failed step.
 - Overrides `agent/request` on the retry so the next attempt uses the new route.
+- **Grades the cooldown by failure code**: a rate limit waits minutes, a rejected
+  request waits much longer, a server blip waits seconds.
+- **Records every route's successes and failures** (through the `llm/stream`
+  waterfall) and persists them.
+- **Reorders each tier by the measured success rate**: a model that keeps failing
+  slides down.
 - **Fits the reasoning effort** to the new model, so a switch does not fail again
   on `UNSUPPORTED_REASONING_EFFORT`.
 - **Keeps the model honest about itself**: it rewrites the prompt's
@@ -95,6 +101,42 @@ own data, so the plugin always spends the least for the best available model:
 - **Credits tier** — the current price, cheapest first. A model with no visible
   price sorts after every priced one.
 - **Paid tier** — no public price list, so the discovery order stands.
+
+### Then adjusted by the measured success rate (v1.6.0)
+
+The order above is the provider's *preference*, not a *fact*. A model that fails
+30% of the time still sits in front of one that never fails, so every turn pays
+for the first failure.
+
+The plugin counts each route's outcomes through the `llm/stream` waterfall
+(successes, failures and rate limits all count), keeps the counters in
+`statsPath` (default `~/.dsh/llm-failover-stats.json`), and reorders **inside
+each tier** by that success rate. Three constraints keep it from thrashing:
+
+1. **The tiers never move** — free always stays before credits, so the cost
+   order is never broken by the success rate.
+2. **An untried route is not a bad route** — a route with too few samples is
+   treated as *unknown* and keeps the position the catalog gave it: it is
+   neither promoted for having no data nor demoted because others failed.
+3. **The score is smoothed and quantized** — the rate is smoothed with a prior
+   (one lucky call cannot outrank a well-tested route) and equal scores keep
+   their relative order, so the chain does not reshuffle on every outcome.
+
+```yaml
+config:
+  # Where the counters are kept. Empty = memory only, nothing written.
+  statsPath: "~/.dsh/llm-failover-stats.json"
+  # How many recent outcomes the success rate is computed over.
+  statsWindow: 50
+  # How many outcomes a route needs before its rate may influence the order.
+  statsMinSamples: 3
+  # Off falls back to the pure catalog order.
+  rankBySuccessRate: true
+```
+
+The counters are **cumulative** (`ok` / `bad`), while the rate is computed over
+the most recent `statsWindow` outcomes, so a route that was reliable for a week
+and started failing today is demoted quickly.
 
 ### Time-windowed free models
 
@@ -163,7 +205,27 @@ config:
   # Leave empty to use whatever the chain ends with.
   fallback: { provider: "", model: "" }
   # How long a route that just failed is skipped, in milliseconds. 0 disables it.
+  # This is the fallback for every code that `cooldownWindows` does not name.
   cooldownMs: 60000
+  # Per-failure-code cooldown windows, in milliseconds. A code named here
+  # replaces the built-in default for that code.
+  cooldownWindows: {}
+  # Where the success/failure counters are kept. Empty = memory only.
+  statsPath: "~/.dsh/llm-failover-stats.json"
+  # How often the counters are written to disk, in milliseconds. 0 = every outcome.
+  statsFlushMs: 5000
+  # How many recent outcomes the success rate is computed over.
+  statsWindow: 50
+  # How many outcomes a route needs before its rate may influence the order.
+  statsMinSamples: 3
+  # Reorder each tier by the measured success rate.
+  rankBySuccessRate: true
+  # The prior weight used to smooth the measured rate (higher = more conservative).
+  statsPriorWeight: 8
+  # Two scores closer than this keep their order (anti-thrash).
+  statsRankEpsilon: 0.02
+  # How long a new measurement may wait before it is used, in milliseconds.
+  statsRefreshMs: 60000
   # For the listed providers, rewrite the harness identity signature in the system
   # prompt (see "Neutralize the harness identity" below). Empty = rewrite none.
   neutralizeIdentityFor: []
@@ -247,15 +309,43 @@ That is the "when the chain can no longer serve the request, try the model you
 trust most one last time and then fail honestly" case, and it is what keeps an
 exhausted chain from looping.
 
-### Cooldown
+### Cooldown (cooldownMs / cooldownWindows)
 
-A route that just failed is not picked again while it cools down (60s by
-default):
+A route that just failed is not picked again while it cools down. One **flat**
+window is wrong for every kind of failure:
+
+- `RATE_LIMIT` — the quota window lasts **minutes**, so a 30s window only
+  guarantees a second hit;
+- `INVALID_REQUEST` (a refused signature) — **permanent**: no wait helps, but a
+  short window means the plugin walks into the same wall on the next step;
+- `SERVER` — 30 seconds is right.
+
+So the plugin **grades the window by failure code**:
+
+| Code | Default cooldown | Why |
+|---|---|---|
+| `RATE_LIMIT`, `QUOTA` | 5 minutes | the upstream window is minutes long |
+| `ACCOUNT_QUOTA` | 15 minutes | the account balance has to be topped up by a human |
+| `AUTH`, `INVALID_CREDENTIAL`, `MISSING_CREDENTIAL`, `AUTHORIZATION_REQUIRED` | 30 minutes | a human has to sign in or replace the key |
+| `INVALID_REQUEST`, `CLIENT_ERROR`, `NO_ADAPTER` | 30 minutes | permanent failure |
+| `REGION_BLOCKED` | 1 hour | a region restriction does not fix itself |
+| `CONTEXT_WINDOW_EXCEEDED`, `INVALID_MODEL_REASONING`, `IMAGE_OFFLOAD_REQUIRED` | 10 minutes | this route cannot serve this request |
+| `SERVER`, `TIMEOUT`, `TRANSPORT` | 30 seconds | a blip |
+| `EMPTY_RESPONSE` | 15 seconds | a blip |
+| any code not listed | `cooldownMs` (60s by default) | the fallback |
+
+Override some of them:
 
 ```yaml
 config:
-  cooldownMs: 60000   # 0 disables it
+  cooldownMs: 30000        # used by every code that is not listed
+  cooldownWindows:
+    RATE_LIMIT: 600000     # 10 minutes
+    SERVER: 5000           # 5 seconds
 ```
+
+A code named in `cooldownWindows` **replaces** the built-in default for that
+code; every other code still uses `cooldownMs`.
 
 So a chain walked several times does not keep hitting the same model that just
 broke. The fallback is exempt from cooldown — it stays the last card.
