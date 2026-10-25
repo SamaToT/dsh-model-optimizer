@@ -10,7 +10,10 @@ registered, context window exceeded — the turn simply ends. There is no
 built-in way to continue on a different model.
 
 This plugin adds it. When the model you selected cannot serve the request, it
-switches to another one, **cheapest first**:
+switches to another one, **cheapest first**. The core rule: **walk the whole
+chain to exhaustion — only report an error when every single route has
+failed.** Not "try a few then give up" — every route on the chain gets its
+turn, and the turn ends in error only when the last one fails too.
 
 > **It filters on cost, not quality.** The "optimizer" in the name means "of the
 > models that can serve the request, the one that costs least" — not "the
