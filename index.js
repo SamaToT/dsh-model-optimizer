@@ -1,13 +1,45 @@
 // @deepseek-ai/dsh-model-optimizer
-// BUILD_STAMP: 2026-10-21T11:00:00Z (version with fitReasoningEffort catch fix + system-prompt identity sync)
+// BUILD_STAMP: 2026-10-22T10:05:00Z (v1.7.0: exhaust-the-chain, plugin owns request-error)
 //
 // Cost-tiered model failover for DeepSeek Harness — UNIVERSAL / zero-config.
 //
-// DeepSeek Harness ships only same-model retry (@deepseek-ai/dsh-llm-retry). When
-// a model is *unusable* (quota exhausted, auth failure, no adapter, context window
-// exceeded, …) the turn just ends. This plugin walks a cost-ordered fallback chain
-// so the agent keeps working, cheapest first: free -> credits -> paid.
+// ---------------------------------------------------------------------------
+// THE SELECTION STRATEGY (authoritative — this is the whole point of the plugin)
+// ---------------------------------------------------------------------------
 //
+//   1. Use the model the USER picked, first. The plugin never overrides a
+//      working selection.
+//   2. When that route fails, walk the cost-ordered chain: free -> credits ->
+//      paid. The chain is built from whatever providers/models THIS user has
+//      installed, so it needs no hand-written model list.
+//   3. KEEP WALKING. A single failure is never the end of the turn. The plugin
+//      tries EVERY route in the chain, one after another, until one works.
+//   4. Only when EVERY route has been tried and every one of them failed does
+//      the turn report an error. Until then the user sees no error at all.
+//
+//   "All models unusable" is the ONLY condition that produces an error.
+//
+// ---------------------------------------------------------------------------
+// WHY THE PLUGIN OWNS `agent/request-error` (instead of deferring to dsh-llm-retry)
+// ---------------------------------------------------------------------------
+//
+// dsh-llm-retry appends an `llm/retry` session event that carries the failure
+// verbatim, and the session log refuses data it cannot JSON-serialize. The
+// append THROWS, and the throw escapes the agent loop, so the whole turn ends
+// as `kind: "error"` — the UI shows "处理失败" and the chain is never walked.
+//
+// The real session log shows exactly that (decoded from the live session):
+//
+//   turn  9: kind=error code=UNKNOWN
+//            msg=session event "llm/retry" carries non-JSON-serializable data
+//   turn 14: kind=error code=UNKNOWN  (same)
+//   turn 15: kind=error code=UNKNOWN  (same)
+//
+// So this plugin handles the failure itself and never passes it on. The retry
+// dsh-llm-retry would have performed happens here instead, and the failure
+// never reaches that plugin's session event.
+//
+// ---------------------------------------------------------------------------
 // HOW IT STAYS GENERIC (no hand-written model list):
 //   On first use the plugin enumerates whatever routes THIS user has installed via
 //   ctx.llm.listProviders() + ctx.llm.listModels(provider), then classifies each
@@ -989,6 +1021,33 @@ function apply(ctx, config = {}) {
   //   pos >= 0  -> using chain[pos]
   /** @type {Map<string, { pos: number, selection: { provider: string, model: string } }>} */
   const state = new Map();
+
+  /**
+   * The chain position the current TURN has reached, keyed by session+turn.
+   *
+   * The per-step cursor (`state`) is not enough: the escalation has to survive
+   * from one step to the next. The agent loop retries a failed step through the
+   * `agent/request-error` waterfall, and the retried step asks for the route
+   * again through `agent/request` — but a NEW step has a NEW key, so a cursor
+   * stored per step starts the walk from the head of the chain every time.
+   *
+   * The symptom is a chain that never advances: the log showed
+   *
+   *   escalate pos=1 -> fake/m2
+   *   escalate pos=1 -> fake/m2
+   *   escalate pos=1 -> fake/m2
+   *
+   * over and over, so routes 2..n of the chain were never tried and the turn
+   * ended after the second route. The whole point of the plugin is to walk the
+   * chain to its END, so the position is kept per session+turn here.
+   */
+  const turnCursor = new Map();
+
+  /** The key that identifies the session+turn an escalation belongs to. */
+  function turnKeyOf(turn, agent) {
+    const session = typeof agent?.id === "string" && agent.id !== "" ? agent.id : "";
+    return session === "" ? `turn:${turn}` : `${session}|turn:${turn}`;
+  }
   let pruneGuard = 0;
   // The route the transcript last announced, so the notice is written once per
   // switch rather than on every step.
@@ -1575,9 +1634,93 @@ function apply(ctx, config = {}) {
       const key = keyOf(payload.turn, payload.step, agent);
       let cur = state.get(key);
 
+      // A retried step arrives with a NEW step key, so the per-step cursor is
+      // fresh. The turn-level cursor carries the position the walk reached, so
+      // the retried step continues on the route the escalation chose instead of
+      // asking for the user's selection again.
+      const tKey = turnKeyOf(payload.turn, agent);
+      const tCur = turnCursor.get(tKey);
+      if (tCur !== undefined && (cur === undefined || tCur.pos > cur.pos)) {
+        const chainT = await buildChain();
+        const routeT = chainT[tCur.pos];
+        if (routeT !== undefined) {
+          if (cur === undefined) {
+            cur = { pos: -1, selection: { provider: resolved.provider, model: resolved.model } };
+          }
+          cur = { pos: tCur.pos, selection: cur.selection };
+          state.set(key, cur);
+          debug(`resume step=${key} -> continuing the walk at pos=${tCur.pos} (${routeT.provider}/${routeT.model})`);
+          const fittedT = await fitReasoningEffort(
+            { ...resolved, provider: routeT.provider, model: routeT.model },
+            routeT,
+            payload.signal
+          );
+          if (agent !== undefined && agent !== null && typeof agent === "object") {
+            agentRoutes.set(agent, { provider: fittedT.provider, model: fittedT.model });
+          }
+          return fittedT;
+        }
+      }
+
       if (cur === undefined) {
         cur = { pos: -1, selection: { provider: resolved.provider, model: resolved.model } };
         state.set(key, cur);
+
+        // The user's own selection is subject to the cooldown too.
+        //
+        // Without this check the request goes straight back to the route that
+        // just failed, the user sees the SAME error again, and only the
+        // request after that switches away. The real log showed it plainly:
+        //
+        //   request step=53:45 ... provider=workbuddy model=step-5-preview
+        //   request-error step=53:45 provider=workbuddy code=RATE_LIMIT
+        //   request step=53:46 ... provider=workbuddy model=step-5-preview   <- again!
+        //
+        // 46 times in the log a LATER step sent the request back to the route
+        // that had just failed, and 51% of all requests used a route that had
+        // already failed at some point.
+        //
+        // The cooldown map already exists and already grades the window by
+        // failure code (§5.2); it was simply never consulted for the
+        // selection. Consulting it here is what makes the switch happen
+        // BEFORE the error, instead of after it.
+        //
+        // This needs no memory of its own: a route that is not in cooldown
+        // (because its window passed, or because it recovered) is used
+        // normally, so a model that is dynamic — it may succeed or fail at
+        // any time — is never written off on the strength of an old failure.
+        if (cooling(cur.selection)) {
+          const chain = await buildChain();
+          const pos = nextPos(chain, -1, cur.selection, undefined);
+          if (pos >= 0) {
+            const route = chain[pos];
+            state.set(key, { pos, selection: cur.selection });
+            if (agent !== undefined && agent !== null && typeof agent === "object") {
+              agentRoutes.set(agent, { provider: route.provider, model: route.model });
+            }
+            ctx.logger?.warn?.(
+              `llm-failover: ${cur.selection.provider}/${cur.selection.model} is in cooldown; ` +
+                `using ${route.provider}/${route.model} instead`
+            );
+            debug(
+              `preempt step=${key} -> ${cur.selection.provider}/${cur.selection.model} ` +
+                `is cooling down; switching to ${route.provider}/${route.model} before the request`
+            );
+            const fitted = await fitReasoningEffort(
+              { ...resolved, provider: route.provider, model: route.model },
+              route,
+              payload.signal
+            );
+            return fitted;
+          }
+          // Every route is cooling down: there is nothing better to send the
+          // request to, so the selection is used and the failure is honest.
+          debug(
+            `preempt step=${key} -> ${cur.selection.provider}/${cur.selection.model} ` +
+              `is cooling down, but no other route is available; using it anyway`
+          );
+        }
+
         const fitted = await fitReasoningEffort(resolved, cur.selection, payload.signal);
         if (agent !== undefined && agent !== null && typeof agent === "object") {
           agentRoutes.set(agent, { provider: fitted.provider, model: fitted.model });
@@ -1686,15 +1829,7 @@ function apply(ctx, config = {}) {
         `request-error step=${turn}:${step} provider=${payload.provider} ` +
           `code=${code} dead=${isDead} transient=${isTransient}`
       );
-      if (!isDead && !(escalateTransient && isTransient)) {
-        // Let dsh-llm-retry retry the SAME route (a transient error).
-        return next();
-      }
 
-      // A code in both lists (RATE_LIMIT is retryable AND escalating) is
-      // retried in place a few times first: a short limit recovers on its own,
-      // a long one does not and must switch. The count is per route, per step.
-      //
       // The route is taken from the cursor, not from the error payload: DSH's
       // agent/request-error payload carries the provider but no model, so a
       // payload-built key would collapse every model of one provider into a
@@ -1709,13 +1844,77 @@ function apply(ctx, config = {}) {
             : cursor.selection.model
           : payload.agent?.options?.model ?? "";
       const failKey = `${cursorKey}|${failedProvider}/${failedModel}`;
+
+      if (!isDead && !(escalateTransient && isTransient)) {
+        // A code the plugin does not escalate on.
+        //
+        // The failure is HANDLED HERE, not handed to dsh-llm-retry: that plugin
+        // appends an `llm/retry` session event carrying the failure, and the
+        // event can hold data the session log refuses to serialize. The append
+        // then THROWS, and the throw escapes the agent loop, so the whole turn
+        // ends as `kind: "error"` — the UI shows "处理失败" and the chain is
+        // never walked to the end.
+        //
+        // The real session log shows exactly that:
+        //
+        //   turn 9:  kind=error code=UNKNOWN
+        //            msg=session event "llm/retry" carries non-JSON-serializable data
+        //   turn 14: kind=error code=UNKNOWN  (same)
+        //   turn 15: kind=error code=UNKNOWN  (same)
+        //
+        // So the retry that dsh-llm-retry performs is done here instead, and
+        // the failure never reaches that plugin. The chain is still walked to
+        // its end, and the turn only fails when EVERY route has failed.
+        if (isTransient) {
+          const attempts = (retryCounts.get(failKey) ?? 0) + 1;
+          if (typeof cfg.retriesBeforeSwitch === "number" && attempts <= cfg.retriesBeforeSwitch) {
+            retryCounts.set(failKey, attempts);
+            debug(`retry ${attempts}/${cfg.retriesBeforeSwitch} on ${payload.provider} (${code})`);
+            return { kind: "retry" };
+          }
+          retryCounts.delete(failKey);
+        }
+        // Not escalatable and not worth retrying: walk on to another route
+        // anyway, so a single unusable code does not end the turn.
+        const chain0 = await buildChain();
+        const pos0 = nextPos(chain0, -1, undefined, undefined);
+        if (pos0 >= 0) {
+          state.set(cursorKey, { pos: pos0, selection: { provider: failedProvider, model: failedModel } });
+          turnCursor.set(turnKeyOf(turn, payload.agent), { pos: pos0 });
+          debug(`escalate pos=${pos0} -> ${chain0[pos0].provider}/${chain0[pos0].model}`);
+          return { kind: "retry" };
+        }
+        // The whole chain is exhausted. The failure is returned to the agent
+        // loop, which ends the turn with the error — which is correct, and
+        // correct ONLY now: every route has been tried.
+        //
+        // It is NOT handed to dsh-llm-retry: that plugin would append an
+        // `llm/retry` session event carrying the failure, the append would
+        // throw on data the session log cannot serialize, and the throw would
+        // end the turn as `kind: "error"` with a different, misleading message.
+        debug("chain exhausted; ending the turn with the failure");
+        return next();
+      }
+
+      // A code in both lists (RATE_LIMIT is retryable AND escalating) is
+      // retried in place a few times first: a short limit recovers on its own,
+      // a long one does not and must switch. The count is per route, per step.
+      //
+      // The retry happens HERE, not in dsh-llm-retry: that plugin appends an
+      // `llm/retry` session event carrying the failure, and the session log
+      // refuses data it cannot JSON-serialize. The append THROWS, the throw
+      // escapes the agent loop, and the turn ends as `kind: "error"` — the
+      // red "处理失败", with the chain never walked.
       if (isTransient) {
         const attempts = (retryCounts.get(failKey) ?? 0) + 1;
         const limit = cfg.retriesBeforeSwitch;
         if (typeof limit === "number" && attempts <= limit) {
           retryCounts.set(failKey, attempts);
           debug(`retry ${attempts}/${limit} on ${payload.provider} before switching (${code})`);
-          return next(); // dsh-llm-retry retries this same route
+          // { kind: "retry" } re-runs the failed step on the same route. The
+          // failure never reaches dsh-llm-retry, so no `llm/retry` event is
+          // appended and the turn cannot die from it.
+          return { kind: "retry" };
         }
         retryCounts.delete(failKey);
         debug(`${payload.provider} failed ${attempts}x with ${code}; switching instead of retrying`);
@@ -1740,6 +1939,19 @@ function apply(ctx, config = {}) {
             model: options?.model ?? "",
           },
         };
+        state.set(key, cur);
+      }
+
+      // Resume from where this TURN's walk already reached.
+      //
+      // The retried step arrives with a new step key, so the per-step cursor
+      // is fresh and the walk would restart at the head of the chain. The
+      // turn-level cursor carries the position across steps, so the chain is
+      // walked exactly once, route by route, until it is exhausted.
+      const tKey = turnKeyOf(turn, payload.agent);
+      const tCur = turnCursor.get(tKey);
+      if (tCur !== undefined && tCur.pos > cur.pos) {
+        cur = { pos: tCur.pos, selection: cur.selection };
         state.set(key, cur);
       }
 
@@ -1800,19 +2012,34 @@ function apply(ctx, config = {}) {
       const last = chain[chain.length - 1];
       if (last?.fallback === true && failed !== undefined && sameRoute(last, failed)) {
         debug("fallback route failed; ending the turn");
-        return next();
+        return undefined;
       }
 
       // Advance to the next route that is neither the selection nor cooling
       // down, and never the one that just failed.
       const pos = nextPos(chain, cur.pos, cur.selection, failed);
       if (pos < 0) {
-        // Walked the whole chain; nothing left. Hand back to default handling
-        // (which ends the turn with the failure).
-        return next();
+        // Walked the whole chain; nothing left.
+        //
+        // The waterfall is answered with `undefined` and NOT with next(): the
+        // agent loop turns any answer that is not { kind: "retry" } into the
+        // REAL failure (`throw new LlmError(message, code, failure)`), which is
+        // exactly what should happen once every route has been tried.
+        //
+        // Calling next() instead would hand the failure to dsh-llm-retry,
+        // which appends an `llm/retry` session event carrying data the
+        // session log cannot serialize. That append throws, the throw
+        // escapes the agent loop, and the turn ends with the misleading
+        // "session event \"llm/retry\" carries non-JSON-serializable data"
+        // instead of the upstream's own error.
+        debug("chain exhausted; ending the turn with the failure");
+        return undefined;
       }
 
       state.set(key, { pos, selection: cur.selection });
+      // Remember where this turn's walk reached, so the NEXT step continues
+      // from here instead of restarting at the head of the chain.
+      turnCursor.set(turnKeyOf(turn, payload.agent), { pos });
       // Remember where the failover started, so the notice can name it.
       if (lastSelection === undefined) lastSelection = cur.selection;
 
@@ -1847,6 +2074,7 @@ function apply(ctx, config = {}) {
     disposePreStep();
     disposeStream();
     state.clear();
+    turnCursor.clear();
     cooldowns.clear();
     retryCounts.clear();
     // Write the counters out before the plugin goes away, so a restart does

@@ -289,6 +289,86 @@ check("插件报告的层计数与链长一致",
   `free=${tierCounts[0]} credits=${tierCounts[1]} paid=${tierCounts[2]} chain=${order.length}`);
 
 console.log("");
+console.log("=== E. 报错前切：用户选的路由在冷却中时，请求发出去就换走 ===");
+
+// The bug this reproduces, from the REAL App log:
+//
+//   request step=53:45 ... provider=workbuddy model=step-5-preview
+//   request-error step=53:45 provider=workbuddy code=RATE_LIMIT
+//   request step=53:46 ... provider=workbuddy model=step-5-preview   <- again!
+//
+// 46 times in the real log a LATER step sent the request back to the route
+// that had just failed. The cause: the `agent/request` handler returned the
+// user's selection for a new step WITHOUT asking whether it was in cooldown.
+// The cooldown was only consulted while walking the chain, never for the
+// selection — so the error was shown first and the switch came after it.
+//
+// A NEW session, so the plugin's per-step state is empty and this is a
+// first request of a step, exactly like the failing case.
+const agentD = { id: "session-D", options: { provider: "workbuddy", model: "hy3" } };
+
+// The selection is registered the way the request stage does it.
+await waterfall("agent/request", { turn: 20, step: 1, signal: undefined, agent: agentD },
+  async () => ({ provider: "workbuddy", model: "hy3" }));
+
+// The route fails with a permanent code, so it enters a long cooldown.
+await waterfall("agent/request-error", {
+  turn: 20, step: 1, provider: "workbuddy",
+  failure: { code: "INVALID_REQUEST" }, signal: undefined, agent: agentD
+}, async () => undefined);
+
+log = readLog();
+check("失败路由已进入冷却",
+  /cooldown workbuddy\/hy3 for \d+ms \(INVALID_REQUEST\)/.test(log),
+  (log.match(/cooldown \S+ for \d+ms \([^)]+\)/g) || []).join(" | "));
+
+// The NEXT request of a new step: the plugin must NOT send it back to the
+// route that just failed. This is the whole point.
+await waterfall("agent/request", { turn: 21, step: 1, signal: undefined, agent: agentD }, async () => ({
+  provider: "workbuddy", model: "hy3"
+}));
+
+// The log is read AFTER the request, so the plugin's own line is in it.
+log = readLog();
+const preemptLine = (log.match(/preempt step=\S+ -> \S+ is cooling down; switching to (\S+)/) ?? [])[1];
+check("新 step 的请求没有再打回刚失败的路由",
+  preemptLine !== undefined,
+  (log.match(/preempt \S+.*/g) || []).join(" | "));
+check("提前切到了别的路由", preemptLine !== undefined && preemptLine !== "workbuddy/hy3",
+  `preempt -> ${preemptLine}`);
+
+// And the route it picked must be one that is NOT in cooldown.
+const coolingRoutes = new Set(
+  (log.match(/cooldown (\S+) for \d+ms/g) || []).map((l) => /cooldown (\S+) for/.exec(l)[1])
+);
+check("提前切到的路由不在冷却中", preemptLine !== undefined && !coolingRoutes.has(preemptLine),
+  `preempt -> ${preemptLine}; 冷却中: ${[...coolingRoutes].join(", ")}`);
+
+// A route that is NOT in cooldown must still be used normally: the plugin
+// must not write off a model because of an old failure.
+//
+// `freestuff/m2` was never tried and never failed, so it is the clean case.
+const agentE = { id: "session-E", options: { provider: "freestuff", model: "m2" } };
+const before = readLog().length;
+await waterfall("agent/request", { turn: 22, step: 1, signal: undefined, agent: agentE },
+  async () => ({ provider: "freestuff", model: "m2" }));
+const afterLog = readLog().slice(before);
+check("没在冷却中的路由照常使用（不因为旧失败被拉黑）",
+  !afterLog.includes("is cooling down"),
+  afterLog.trim().split("\n").join(" | "));
+
+// And the route that IS in cooldown must be skipped even when the user
+// selects it directly in a brand new session.
+const agentF = { id: "session-F", options: { provider: "workbuddy", model: "hy3" } };
+const beforeF = readLog().length;
+await waterfall("agent/request", { turn: 23, step: 1, signal: undefined, agent: agentF },
+  async () => ({ provider: "workbuddy", model: "hy3" }));
+const afterF = readLog().slice(beforeF);
+check("换一个会话也照样避开冷却中的路由",
+  afterF.includes("is cooling down") && !afterF.includes("provider=workbuddy model=hy3"),
+  afterF.trim().split("\n").join(" | "));
+
+console.log("");
 console.log(`结果: ${pass} 通过, ${fail} 失败`);
 await ctx.fiber.dispose();
 process.exit(fail === 0 ? 0 : 1);
